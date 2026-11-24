@@ -112,6 +112,8 @@ body:not(.tv) .tv-fab { display: grid; }
 .tv-rel .tv-track > .tv-card { flex-basis: clamp(170px, 14vw, 280px); }
 .tv-rel .tv-card .t { font-size: .9em; }
 
+.tv-toast { position: fixed; left: 50%; bottom: 6vh; z-index: 20; transform: translateX(-50%); padding: .7em 1.3em; border-radius: 999px;
+  background: rgba(28,28,31,.96); border: 2px solid rgba(255,255,255,.14); white-space: nowrap; }
 .tv-upnext { position: absolute; right: 3.5vw; bottom: 3.5vw; z-index: 3; display: flex; flex-direction: column; gap: .4em; max-width: 34vw;
   padding: 1.1em 1.4em; border-radius: 16px; background: rgba(20,20,22,.95); border: 2px solid rgba(255,255,255,.14); cursor: pointer; }
 .tv-upnext span, .tv-upnext small { color: var(--muted); }

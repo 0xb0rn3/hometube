@@ -58,10 +58,13 @@
   }
   function skeleton(n) { var out = ''; for (var i = 0; i < n; i++) out += '<div class="tv-card tv-skel"><div class="thumb"></div><div class="meta"><div class="t"></div></div></div>'; return out; }
   function tab(id) { ['homeBtn', 'recBtn', 'historyBtn', 'laterBtn'].forEach(function (b) { $(b).classList.toggle('on', b === id); }); }
-  function focusFirst(scope) {
+  function focusFirst(scope, opened) {
     if (!isTV || inPlayer()) return;   // touch and mouse: nothing to focus, it would only show a ring
-    var f = scope.querySelector('.tv-card[data-nav]');
-    if (f && (document.activeElement === body || !document.activeElement)) focusCard(f);
+    var f = scope.querySelector('.tv-card[data-nav]'), a = document.activeElement;
+    // a list you just opened (results, a section, a channel) takes focus on its first card; a home row
+    // filling in later only takes it when nothing has focus, so it never pulls you off the sections
+    var free = !a || a === body || !a.offsetParent;
+    if (f && (free || (opened && a.closest && a.closest('.tv-top')))) focusCard(f);
   }
   function show(title, list, note) {
     $('rows').hidden = true; $('list').hidden = false;
@@ -69,7 +72,7 @@
     status(note || (list.length ? '' : 'Nothing here yet.'));
     $('grid').innerHTML = list.map(card).join('');
     window.scrollTo(0, 0);
-    focusFirst($('grid'));
+    focusFirst($('grid'), true);
   }
   function row(title, key) {
     var sec = document.createElement('section'); sec.className = 'tv-row';
@@ -107,32 +110,76 @@
     tab('homeBtn');
     $('list').hidden = true; $('rows').hidden = false; $('rows').innerHTML = '';
     status('');
+    var waits = [];
     var cont = row('Continue watching', 'continue');
-    api('history').then(function (h) {
+    waits.push(api('history').then(function (h) {
       var list = continueItems(h);
       cont.fill(list);
       list.slice(0, 2).forEach(function (v) { warm(v.id); });   // the likeliest picks get looked up now
-    }).catch(cont.drop);
+    }).catch(cont.drop));
     var subsRow = row(account ? 'Your subscriptions' : 'Subscriptions');
-    (account ? api('feed?name=subs') : api('home')).then(function (d) {
+    waits.push((account ? api('feed?name=subs') : api('home')).then(function (d) {
       if (d.subscriptions) subs = d.subscriptions;
       subsRow.fill(d.items || []);
-    }).catch(subsRow.drop);
+    }).catch(subsRow.drop));
     TOPICS.forEach(function (t) {   // the board keeps these warm, so they come straight back
       var r = row(t[0]);
-      api('search?q=' + encodeURIComponent(t[1]) + '&topic=1').then(function (d) { r.fill((d.items || []).slice(0, 16)); }).catch(r.drop);
+      waits.push(api('search?q=' + encodeURIComponent(t[1]) + '&topic=1').then(function (d) { r.fill((d.items || []).slice(0, 16)); }).catch(r.drop));
     });
+    return Promise.all(waits);
   }
   function search(q) {
     if (!q.trim()) return;
-    status('Searching…');
-    tab(null);
     closeSearch();
-    api('search?q=' + encodeURIComponent(q)).then(function (d) { show('Results for "' + q + '"', d.items); }).catch(function (e) { status(e.message); });
+    navigate({kind: 'search', q: q});
   }
-  function openChannel(id, name) {
-    status('Loading channel…');
-    api('channel?id=' + encodeURIComponent(id)).then(function (d) { show(name || 'Channel', d.items); }).catch(function (e) { status(e.message); });
+  function openChannel(id, name) { navigate({kind: 'channel', id: id, name: name}); }
+  function runList(title, path, waiting) {
+    status(waiting || '');
+    return api(path).then(function (d) { show(title, d.items || []); }).catch(function (e) { status(e.message); });
+  }
+
+  // ---- where you are: Home, then whatever was opened from it. Back steps back through that, on the
+  // remote and with the phone's back gesture, instead of the browser leaving for the previous address.
+  var stack = [{kind: 'home'}], exitArmed = 0;
+  var TABS = {home: 'homeBtn', history: 'historyBtn', later: 'laterBtn', rec: 'recBtn'};
+  function render(v, focusId) {
+    var done;
+    if (v.kind === 'home') done = loadHome();
+    else if (v.kind === 'search') done = runList('Results for "' + v.q + '"', 'search?q=' + encodeURIComponent(v.q), 'Searching…');
+    else if (v.kind === 'channel') done = runList(v.name || 'Channel', 'channel?id=' + encodeURIComponent(v.id), 'Loading channel…');
+    else if (v.kind === 'history') done = runList('History', 'history');
+    else if (v.kind === 'later') done = runList('Watch Later', account ? 'feed?name=later' : 'later');
+    else if (v.kind === 'rec') done = runList('For you', 'feed?name=rec', 'Loading recommendations…');
+    tab(TABS[v.kind] || null);
+    if (focusId && isTV) done.then(function () {
+      var c = document.querySelector('#rows:not([hidden]) .tv-card[data-id="' + focusId + '"], #list:not([hidden]) .tv-card[data-id="' + focusId + '"]');
+      if (c) focusCard(c);
+    });
+  }
+  function navigate(v) {
+    var top = stack[stack.length - 1], a = document.activeElement;
+    top.focusId = a && a.dataset ? a.dataset.id : null;
+    var section = v.kind in TABS;
+    var replaceTab = section && stack.length === 2 && stack[1].kind in TABS;   // section to section: no extra step
+    stack = section ? [stack[0]].concat(v.kind === 'home' ? [] : [v]) : stack.concat([v]);
+    if (!isTV && v.kind !== 'home') {
+      try { history[replaceTab ? 'replaceState' : 'pushState']({hometube: 'view'}, ''); } catch (e) { /* no history */ }
+    }
+    render(v);
+  }
+  function back() {
+    if (stack.length < 2) return false;
+    stack.pop();
+    var v = stack[stack.length - 1];
+    render(v, v.focusId);
+    return true;
+  }
+  function toast(text) {
+    var el = $('toast');
+    el.textContent = text; el.hidden = false;
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { el.hidden = true; }, 2800);
   }
   function openSearch() { body.classList.add('searching'); $('q').focus(); }
   function closeSearch() { body.classList.remove('searching'); if (document.activeElement === $('q') && !isTV) $('q').blur(); }
@@ -273,7 +320,10 @@
     }
     if (last) saved.then(function () { refreshContinue(last.id); });   // once the position is stored
   }
-  window.addEventListener('popstate', function () { if (inPlayer()) reallyClose(); });
+  window.addEventListener('popstate', function () {
+    if (inPlayer()) { reallyClose(); return; }
+    back();   // the phone's back gesture: one step back inside HomeTube
+  });
   function nextId() {
     if (qi + 1 < queue.length) return {id: queue[qi + 1], list: queue, index: qi + 1};
     if (related.length) return {id: related[0].id, list: related.map(function (r) { return r.id; }), index: 0, name: 'Suggested'};
@@ -579,8 +629,21 @@
     var typing = act && (act.tagName === 'INPUT' || act.tagName === 'TEXTAREA');
     if (DIRS[k] && !isTV && !typing && !isTouch && !inPlayer()) setMode(true);   // arrows on the home page of a non-touch screen: remote or keyboard mode
     if (!inPlayer()) {
-      if (k === 27 && body.classList.contains('searching')) { closeSearch(); return; }
-      if (BACK.indexOf(k) >= 0) return;   // the browser handles Back on the home page
+      if (BACK.indexOf(k) >= 0 && !(k === 8 && typing)) {
+        if (body.classList.contains('searching')) { e.preventDefault(); closeSearch(); return; }
+        if (!isTV) {   // phones and desktops: the same step as the browser's back
+          if (history.state && history.state.hometube === 'view') { e.preventDefault(); history.back(); }
+          return;
+        }
+        e.preventDefault();
+        if (typing) { act.blur(); toTabs(); return; }
+        if (back()) return;   // one step back: search results, a channel, a section
+        // Home: first up to the sections, then a second Back within 3 s leaves HomeTube
+        if (!(act && act.closest && act.closest('.tv-tabs'))) { toTabs(); return; }
+        if (Date.now() - exitArmed > 3000) { exitArmed = Date.now(); toast('Press Back again to exit HomeTube'); return; }
+        try { history.back(); } catch (err) { /* nowhere to go */ }
+        return;
+      }
       if (!isTV) return;
       if (typing && (k === 37 || k === 39)) return;   // moving inside the search words
       if (DIRS[k]) { e.preventDefault(); moveHome(DIRS[k]); return; }
@@ -644,10 +707,10 @@
   $('searchForm').addEventListener('submit', function (e) { e.preventDefault(); search($('q').value); });
   $('searchOpen').addEventListener('click', openSearch);
   $('searchClose').addEventListener('click', closeSearch);
-  $('homeBtn').addEventListener('click', loadHome);
-  $('historyBtn').addEventListener('click', function () { tab('historyBtn'); api('history').then(function (d) { show('History', d.items); }); });
-  $('laterBtn').addEventListener('click', function () { tab('laterBtn'); api(account ? 'feed?name=later' : 'later').then(function (d) { show('Watch Later', d.items); }).catch(function (e) { status(e.message); }); });
-  $('recBtn').addEventListener('click', function () { tab('recBtn'); status('Loading recommendations…'); api('feed?name=rec').then(function (d) { show('For you', d.items); }).catch(function (e) { status(e.message); }); });
+  $('homeBtn').addEventListener('click', function () { navigate({kind: 'home'}); });
+  $('historyBtn').addEventListener('click', function () { navigate({kind: 'history'}); });
+  $('laterBtn').addEventListener('click', function () { navigate({kind: 'later'}); });
+  $('recBtn').addEventListener('click', function () { navigate({kind: 'rec'}); });
   $('closeBtn').addEventListener('click', closePlayer);
   $('backFab').addEventListener('click', closePlayer);
   $('playBtn').addEventListener('click', togglePlay);
@@ -700,5 +763,5 @@
   Promise.all([
     api('config').then(function (c) { TOPICS = c.rows || []; }).catch(function () {}),
     api('account').then(function (d) { account = !!d.connected; $('recBtn').hidden = !account; }).catch(function () {})
-  ]).then(loadHome);
+  ]).then(function () { render(stack[0]); });
 })();
