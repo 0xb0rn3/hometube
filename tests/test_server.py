@@ -12,6 +12,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+import nonet  # noqa: F401  (no network in the tests, see nonet.py)
 # the tests run on the defaults, never on the settings of the machine they run on
 os.environ['HOMETUBE_CONFIG'] = '/nonexistent/hometube-tests.json'
 import hometube as ht

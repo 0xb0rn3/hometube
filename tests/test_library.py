@@ -13,6 +13,7 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
+import nonet  # noqa: F401  (no network in the tests, see nonet.py)
 # the tests run on the defaults, never on the settings of the machine they run on
 os.environ['HOMETUBE_CONFIG'] = '/nonexistent/hometube-tests.json'
 import hometube as ht
@@ -32,7 +33,8 @@ class LibraryTests(unittest.TestCase):
     def test_search_keeps_valid_entries(self):
         fake = {'entries': [{'id': 'jNQXAC9IVRw', 'title': 'Me at the zoo', 'channel': 'jawed', 'channel_id': 'UC4QobU6STFB0P71PMvOGN5A', 'duration': 19},
                             {'id': 'bad id', 'title': 'x'}, {'id': 'abcdefghijk', 'channel_id': 'not-a-channel'}]}
-        with mock.patch.object(ht, '_ytdlp', return_value=fake):
+        # YouTube's own search endpoint answers nothing, so the yt-dlp fallback is what is tested
+        with mock.patch.object(ht, 'search_direct', side_effect=OSError('offline')), mock.patch.object(ht, '_ytdlp', return_value=fake):
             items = ht.search('zoo')
         self.assertEqual([i['id'] for i in items], ['jNQXAC9IVRw', 'abcdefghijk'])
         self.assertIsNone(items[1]['channel_id'])
