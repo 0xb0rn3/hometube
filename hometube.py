@@ -50,7 +50,7 @@ CONFIG_PATH = Path(os.environ.get('HOMETUBE_CONFIG', '/etc/hometube/config.json'
 # Home: regular videos (music is left out of these rows); the Music tab: music only
 DEFAULT_ROWS = [['Live now', 'live stream'], ['News', 'world news today'], ['Sports', 'sports highlights'],
                 ['Comedy', 'stand up comedy'], ['Movies & trailers', 'official trailer'], ['Tech', 'tech review'],
-                ['Science', 'science explained'], ['Documentaries', 'documentary'], ['Food', 'cooking recipe']]
+                ['Science', 'science explained'], ['Documentaries', 'documentary'], ['Food', 'cooking show']]
 DEFAULT_MUSIC_ROWS = [['New music', 'new official music video'], ['Pop', 'pop music video'], ['Hip hop', 'hip hop music video'],
                       ['R&B', 'rnb music video'], ['Afrobeats', 'afrobeats new songs'], ['Amapiano', 'amapiano new songs'],
                       ['Latin', 'latin music video'], ['Rock', 'rock music video'], ['Electronic', 'electronic music video'],
