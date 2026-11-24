@@ -26,8 +26,9 @@
   // a first guess from what the browser says; what the person actually does decides (below): TV browsers
   // often claim a touch screen, and do not all name themselves
   var isTouch = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches) && ('ontouchstart' in window);
-  // "ViewPort/": the browser of the owner's Hisense VIDAA TV, which does not name itself (measured)
-  var isTV = /VIDAA|Hisense|HiSmart|SMART-TV|SmartTV|Smart TV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV|Roku|Philips|TV Safari|ViewPort\//i.test(UA);
+  // the owner's Hisense VIDAA TV does not name itself: its browser says "X11; Linux armv7l ... Chrome/111
+  // ViewPort/5.2.20" or "... WebExplorer/1.2.1" (measured). 32-bit ARM desktop Linux: TVs and set-top boxes
+  var isTV = /VIDAA|Hisense|HiSmart|SMART-TV|SmartTV|Smart TV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV|Roku|Philips|TV Safari|ViewPort\/|WebExplorer\/|X11; Linux armv7l/i.test(UA);
   var namedTV = isTV;    // a browser that says it is a TV stays one: a TV has no touch screen (its cursor's clicks can arrive as touches)
   var touched = false;   // a finger really touched the screen
   function setMode(tv) {
@@ -180,6 +181,7 @@
   }
   function search(q) {
     if (!q.trim()) return;
+    fromPlayer();
     closeSearch();
     navigate({kind: 'search', q: q});
   }
@@ -390,6 +392,17 @@
     }
     if (last) saved.then(function () { refreshContinue(last.id); });   // once the position is stored
   }
+  // from the video to Home, a section or search: it closes (where you got to is kept for Continue watching)
+  function fromPlayer() {
+    if (!inPlayer()) return;
+    reallyClose();
+    try { if (history.state && history.state.hometube === 'player') history.replaceState(null, ''); } catch (e) { /* no history */ }
+  }
+  function toTop() {   // the top bar above the watch page: its height, for the page below it
+    var top = document.querySelector('.tv-top');
+    if (top) document.documentElement.style.setProperty('--toph', top.offsetHeight + 'px');
+  }
+  window.addEventListener('resize', toTop);
   window.addEventListener('popstate', function () {
     if (inPlayer()) { reallyClose(); return; }
     back();   // the phone's back gesture: one step back inside HomeTube
@@ -501,6 +514,8 @@
   function setFull(on) {
     full = on;
     $('player').classList.toggle('full', on); $('player').classList.toggle('windowed', !on);
+    body.classList.toggle('pwin', !on);   // the watch page keeps the top bar: Home, the sections, search
+    if (!on) toTop();
     $('fsIcon').setAttribute('d', on ? ICON.exit : ICON.enter);
     $('fsLabel').textContent = on ? 'Exit full screen' : 'Full screen';
     $('fsBtn').setAttribute('aria-label', $('fsLabel').textContent);
@@ -836,11 +851,13 @@
   $('searchForm').addEventListener('submit', function (e) { e.preventDefault(); search($('q').value); });
   $('searchOpen').addEventListener('click', openSearch);
   $('searchClose').addEventListener('click', closeSearch);
-  $('homeBtn').addEventListener('click', function () { navigate({kind: 'home'}); });
-  $('musicBtn').addEventListener('click', function () { navigate({kind: 'music'}); });
-  $('historyBtn').addEventListener('click', function () { navigate({kind: 'history'}); });
-  $('laterBtn').addEventListener('click', function () { navigate({kind: 'later'}); });
-  $('recBtn').addEventListener('click', function () { navigate({kind: 'rec'}); });
+  $('homeBtn').addEventListener('click', function () { fromPlayer(); navigate({kind: 'home'}); });
+  $('musicBtn').addEventListener('click', function () { fromPlayer(); navigate({kind: 'music'}); });
+  $('pHome').addEventListener('click', function () { fromPlayer(); navigate({kind: 'home'}); });
+  $('pSearch').addEventListener('click', function () { fromPlayer(); openSearch(); });
+  $('historyBtn').addEventListener('click', function () { fromPlayer(); navigate({kind: 'history'}); });
+  $('laterBtn').addEventListener('click', function () { fromPlayer(); navigate({kind: 'later'}); });
+  $('recBtn').addEventListener('click', function () { fromPlayer(); navigate({kind: 'rec'}); });
   $('closeBtn').addEventListener('click', closePlayer);
   $('backFab').addEventListener('click', closePlayer);
   $('playBtn').addEventListener('click', togglePlay);

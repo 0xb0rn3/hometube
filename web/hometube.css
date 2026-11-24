@@ -11,6 +11,10 @@ html, body { margin: 0; background: var(--bg); color: var(--text); font-family: 
 body { font-size: clamp(14px, 1.15vw, 22px); }
 body.playing { overflow: hidden; }
 body.playing .tv-top, body.playing main { display: none; }
+/* the watch page keeps the top bar (Home, the sections, search); full screen has its own Home and Search */
+body.playing.pwin .tv-top { display: flex; position: fixed; top: 0; left: 0; right: 0; z-index: 11; }
+body.playing.pwin .tv-player.windowed { top: var(--toph, 5vw); }
+body.touch.playing.pwin .tv-player.windowed { padding-bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }   /* room for the bottom bar */
 button, input, select { font: inherit; color: inherit; }
 button { cursor: pointer; }
 svg { fill: currentColor; }
