@@ -4,7 +4,7 @@ YouTube for the TV, served by a small board on your home network.
 
 HomeTube is one Python program. It serves a 10-foot page you open in the TV's own browser, looks
 videos up, and relays the streams, so the TV only ever talks to the board. Subscriptions, history and
-Watch Later are kept on the board. It runs well on a 4-core ARM board with 4 GB of RAM (developed on a
+Watch Later are kept on the board. It needs no VPN, and runs well on a 4-core ARM board with 4 GB of RAM (developed on a
 KickPi K2B, Allwinner H618, Armbian on Debian 13). There are no Shorts anywhere.
 
 ## What it does
@@ -35,10 +35,34 @@ puts the program in `/opt/hometube`, yt-dlp in its own environment there, and th
 against its published SHA-256). It adds a service and a daily yt-dlp update (YouTube changes often).
 Running it again updates the program and keeps your settings and everything saved.
 
-## Through a VPN
+## A VPN is optional
 
-HomeTube's own traffic can be pinned to a VPN tunnel's routing table, so YouTube sees the tunnel's
-address, not your home's:
+HomeTube needs no VPN: installed as above it goes out through your internet connection and works
+straight away. If you want a VPN for it, there are two ways, and neither touches the rest of the board.
+
+**Its own tunnel, from your provider's configs.** Any WireGuard provider works (Mullvad, Proton, IVPN,
+AirVPN, your own server...): a single `.conf`, or the `.zip` of many servers most providers offer.
+
+```sh
+sudo ./install.sh --vpn ~/Downloads/wireguard-configs.zip
+# or later, on an installed board:
+sudo python3 /opt/hometube/hometube.py vpn import ~/Downloads/se-sto-wg-001.conf
+sudo python3 /opt/hometube/hometube.py vpn status
+sudo python3 /opt/hometube/hometube.py vpn off      # back to going out directly
+```
+
+- HomeTube gets a tunnel of its own (`htvpn`) that only its account uses; nothing else on the board
+  changes, and the board's DNS stays as it is.
+- The fastest server that answers is picked (measured from the board). Every minute a check pings
+  through the tunnel; after three checks without any answer it moves to the next fastest. A working
+  tunnel moves only for a server at least a quarter and 20 ms faster (re-measured every 6 hours), and
+  also when YouTube refuses lookups through it (a new server counts once a fresh lookup works).
+- HomeTube's own name lookups go to the provider's resolver from the config (or 1.1.1.1 and 9.9.9.9
+  when it names none) through the tunnel, so your internet provider does not see what it looks up.
+- It fails closed: if the server stops answering, HomeTube waits for the check to move it rather than
+  going out directly. Pre-shared keys and servers named by hostname are supported.
+
+**An existing tunnel on the board.** If the board already has a VPN with its own routing table:
 
 ```sh
 sudo ./install.sh --route-table 200 --route-dev wg0 --after wg-quick@wg0.service
@@ -47,19 +71,17 @@ sudo ./install.sh --route-table 200 --route-dev wg0 --after wg-quick@wg0.service
 - `--route-table` adds a rule for HomeTube's account only (`ip rule ... uidrange <uid> lookup 200`).
   Give that table an unreachable fallback route so it fails closed when the tunnel is down.
 - `--route-dev` makes HomeTube ask the kernel, before every request to YouTube, which way its traffic
-  would leave. If it is not `wg0` (the rule was removed, the account changed, the tunnel is gone),
-  HomeTube sends nothing and the TV shows why.
-- With a routing table the service gets no IPv6 sockets at all, so an IPv6 route cannot take it
-  around the (IPv4) rule.
+  would leave. If it is not `wg0`, HomeTube sends nothing and the TV shows why.
 
-Why this matters with a relay: the TV plays whatever the board hands it, so a board going out the
-wrong way would still play. The route check is what turns that into a visible stop.
+With either, the service gets no IPv6 sockets at all, so an IPv6 route cannot take it around the
+(IPv4) rule. Why the check matters with a relay: the TV plays whatever the board hands it, so a board
+going out the wrong way would still play; the route check is what turns that into a visible stop.
 
 To see the state, on the board:
 
 ```sh
 curl -s http://127.0.0.1:8890/api/tv/status
-# {"route_dev": "wg0", "route_ok": true, "route_problem": null, "youtube_saw": "<address>", ...}
+# {"route_dev": "htvpn", "route_ok": true, "route_problem": null, "youtube_saw": "<address>", ...}
 ```
 
 `youtube_saw` is the address YouTube put in the last stream it handed out: the address it saw.
@@ -75,6 +97,7 @@ curl -s http://127.0.0.1:8890/api/tv/status
 | `route_table` | none | routing table for HomeTube's traffic |
 | `route_pref` | `91` | priority of that rule |
 | `route_dev` | none | interface the traffic must leave by (fails closed) |
+| `resolvers` | none | DNS servers for HomeTube's own lookups (set by `vpn import`) |
 | `after_unit` | none | start after this unit |
 | `label` | none | shown after "HomeTube" in the page title |
 | `rows` | a few general rows | home rows: `[["Title", "search words"], ...]` |

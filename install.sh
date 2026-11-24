@@ -17,14 +17,17 @@
 #   --after UNIT       start after this unit, e.g. the tunnel's
 #   --label TEXT       shown after "HomeTube" in the page title
 #   --deno PATH        use this deno binary instead of downloading the latest release
+#   --vpn FILE         optional: HomeTube's own WireGuard tunnel from your provider's configs (a .conf, or a
+#                      .zip of many servers; any provider). HomeTube needs no VPN; without this it goes out directly
 #
 # Running it again updates the program and keeps the settings and everything you saved.
 set -euo pipefail
+ORIG_PWD=$PWD
 cd "$(dirname "$(readlink -f "$0")")"
 
 APP=/opt/hometube
 ETC=/etc/hometube
-BIND= PORT= TABLE= PREF= DEV= AFTER= LABEL= DENO_FROM=
+BIND= PORT= TABLE= PREF= DEV= AFTER= LABEL= DENO_FROM= VPN_FILE=
 while [ $# -gt 0 ]; do
   case "$1" in
     --bind) BIND=$2; shift 2;;
@@ -35,7 +38,8 @@ while [ $# -gt 0 ]; do
     --after) AFTER=$2; shift 2;;
     --label) LABEL=$2; shift 2;;
     --deno) DENO_FROM=$2; shift 2;;
-    -h|--help) sed -n '2,22p' "$0"; exit 0;;
+    --vpn) VPN_FILE=$(cd "$ORIG_PWD" && readlink -f "$2"); [ -f "$VPN_FILE" ] || { echo "no such file: $2" >&2; exit 2; }; shift 2;;
+    -h|--help) sed -n '2,25p' "$0"; exit 0;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2;;
   esac
 done
@@ -105,3 +109,8 @@ PY
 HOMETUBE_CONFIG="$ETC/config.json" python3 -c "import sys; sys.path.insert(0, '$APP'); import hometube" >/dev/null
 sync   # small boards often write to flash late: make sure nothing is lost to a power cut
 HOMETUBE_CONFIG="$ETC/config.json" python3 "$APP/hometube.py" install-units
+if [ -n "$VPN_FILE" ]; then
+  echo "[+] HomeTube's own VPN from $(basename "$VPN_FILE")"
+  command -v wg-quick >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wireguard-tools >/dev/null
+  HOMETUBE_CONFIG="$ETC/config.json" python3 "$APP/hometube.py" vpn import "$VPN_FILE"
+fi

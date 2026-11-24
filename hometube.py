@@ -9,6 +9,8 @@ daily, because YouTube changes often. No Shorts anywhere.
   python3 hometube.py serve              # the service, started by systemd
   python3 hometube.py install-units      # root: account, optional VPN routing rule, service, daily yt-dlp update
   python3 hometube.py cookies FILE       # root: connect a YouTube account (cookies.txt); --clear to disconnect
+  python3 hometube.py vpn import FILE    # root, optional: HomeTube's own WireGuard tunnel from any provider's
+                                         #   .conf or .zip (the fastest server is picked and kept); vpn status, vpn off
 
 Settings: /etc/hometube/config.json (or $HOMETUBE_CONFIG), all optional:
   bind, port        where the page and API listen (127.0.0.1:8891; 0.0.0.0 to serve the TV directly)
@@ -16,6 +18,7 @@ Settings: /etc/hometube/config.json (or $HOMETUBE_CONFIG), all optional:
   route_dev         the tunnel interface that traffic must leave by (e.g. wg0): checked before every
                     request to YouTube, and HomeTube refuses to go out any other way (fails closed)
   after_unit        a unit to start after, e.g. wg-quick@wg0.service
+  resolvers         DNS servers for HomeTube's own lookups (set by `vpn import`: the provider's, in the tunnel)
   label             shown after "HomeTube" in the page title
   rows              the home page rows: [["Title", "search words"], ...]
 """
@@ -46,10 +49,18 @@ DEFAULT_ROWS = [['Music', 'official music video'], ['Live now', 'live stream'], 
                 ['Tech', 'tech review'], ['News', 'world news today'], ['Comedy', 'stand up comedy'], ['Science', 'science documentary']]
 DEFAULTS: dict[str, Any] = {'bind': '127.0.0.1', 'port': 8891, 'app_dir': '/opt/hometube', 'state_dir': '/var/lib/hometube',
                             'user': 'hometube', 'route_table': None, 'route_pref': 91, 'route_dev': '', 'after_unit': '', 'label': '',
+                            'resolvers': [],
                             'rows': DEFAULT_ROWS}
 _UNIT_NAME = re.compile(r'[A-Za-z0-9@._-]{1,120}')
 _ACCOUNT = re.compile(r'[a-z_][a-z0-9_-]{0,31}')
 _IFACE = re.compile(r'[A-Za-z0-9_.-]{1,15}')
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).version == 4
+    except ValueError:
+        return False
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -77,6 +88,9 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         raise ValueError('route_table must be a table number or null')
     if not isinstance(cfg['route_pref'], int) or not 1 <= cfg['route_pref'] < 32766:
         raise ValueError('route_pref must be 1-32765')
+    res = cfg['resolvers']
+    if not isinstance(res, list) or len(res) > 3 or not all(isinstance(r, str) and _is_ipv4(r) for r in res):
+        raise ValueError('resolvers must be up to three IPv4 addresses')
     if cfg['route_dev'] and not _IFACE.fullmatch(str(cfg['route_dev'])):
         raise ValueError('route_dev must be an interface name')
     if cfg['after_unit'] and not _UNIT_NAME.fullmatch(cfg['after_unit']):
@@ -186,7 +200,7 @@ _exit_seen = {'ip': None, 'at': 0}
 ROUTE_PROBE = '142.250.0.1'   # any public address: the question is which way this account's traffic leaves
 
 
-def route_status(force: bool = False) -> tuple[bool, str]:
+def route_status(force: bool = False, uid: int | None = None) -> tuple[bool, str]:
     """With route_dev set: does this account's traffic leave by that interface right now? Asked of
     the kernel (ip route get ... uid), cached for 20 s. Without route_dev there is nothing to check."""
     dev = CONFIG['route_dev']
@@ -196,7 +210,7 @@ def route_status(force: bool = False) -> tuple[bool, str]:
         if not force and time.time() - _route['at'] < 20:
             return _route['ok'], _route['why']
         try:
-            out = subprocess.run(['ip', '-4', 'route', 'get', ROUTE_PROBE, 'uid', str(os.getuid())],
+            out = subprocess.run(['ip', '-4', 'route', 'get', ROUTE_PROBE, 'uid', str(os.getuid() if uid is None else uid)],
                                  capture_output=True, text=True, timeout=5)
             words = out.stdout.split()
             via = words[words.index('dev') + 1] if 'dev' in words else None
@@ -1241,6 +1255,10 @@ def unit_files(uid: int) -> dict[str, str]:
     if CONFIG['route_dev']:
         families += ' AF_NETLINK'   # the route check asks the kernel (ip route get)
     state = 'StateDirectory=hometube\n' if STATE == Path('/var/lib/hometube') else f'ReadWritePaths={STATE}\n'
+    if CONFIG['resolvers']:
+        # HomeTube's own lookups go to these resolvers from its own account, so through its tunnel too:
+        # the internet provider does not see the names it looks up
+        state += f'BindReadOnlyPaths={VPN_RESOLV}:/etc/resolv.conf {VPN_NSSWITCH}:/etc/nsswitch.conf\n'
     service = f"""[Unit]
 Description=HomeTube: YouTube for the TV
 After=network-online.target{(' ' + after) if after else ''}
@@ -1302,8 +1320,19 @@ def install_units() -> None:
     if STATE != Path('/var/lib/hometube'):
         STATE.mkdir(parents=True, exist_ok=True)
         os.chown(STATE, uid, int(subprocess.run(['id', '-g', USER], capture_output=True, text=True, check=True).stdout))
-    for name, text in unit_files(uid).items():
+    if CONFIG['resolvers']:   # what the unit binds over /etc/resolv.conf and /etc/nsswitch.conf
+        _write_unit(VPN_RESOLV, ''.join(f'nameserver {r}\n' for r in CONFIG['resolvers']) + 'options timeout:2 attempts:2\n')
+        _write_unit(VPN_NSSWITCH, _nsswitch_files_dns())
+    own_vpn = CONFIG['route_dev'] == VPN_IFACE
+    units = unit_files(uid)
+    if own_vpn:
+        units.update(vpn_check_units())
+    for name, text in units.items():
         _write_unit(Path('/etc/systemd/system') / name, text)
+    if not own_vpn:
+        for name in vpn_check_units():
+            subprocess.run(['systemctl', 'disable', '--now', name], capture_output=True)
+            (Path('/etc/systemd/system') / name).unlink(missing_ok=True)
     os.sync()
     # a rule left from an earlier table would keep this account's traffic going that way: clear them
     # all; the service puts back the one it should have when it starts
@@ -1314,6 +1343,8 @@ def install_units() -> None:
     subprocess.run(['systemctl', 'enable', f'{UNIT}.service', f'{UNIT}-update.timer'], check=True)
     subprocess.run(['systemctl', 'restart', f'{UNIT}.service'], check=True)
     subprocess.run(['systemctl', 'start', f'{UNIT}-update.timer'], check=True)
+    if own_vpn:
+        subprocess.run(['systemctl', 'enable', '--now', f'{UNIT}-vpn.timer'], check=True)
     where = f"http://{CONFIG['bind'] if CONFIG['bind'] not in ('0.0.0.0', '::') else '<this board>'}:{PORT}/"
     print(f'HomeTube running: {where}' + (f" (its traffic only through table {CONFIG['route_table']})" if CONFIG['route_table'] is not None else ''))
 
@@ -1336,6 +1367,359 @@ def cookies_command(args: list[str]) -> None:
     print(f"YouTube account connected ({result['cookies']} cookies kept).")
 
 
+
+# ---- HomeTube's own VPN (optional). HomeTube needs no VPN. Someone who wants one for HomeTube imports
+# their provider's WireGuard configs (a .conf, or a .zip of many servers: Mullvad, Proton, IVPN, their
+# own server...). HomeTube then gets a tunnel of its own (htvpn), used by its account only, with the
+# fastest server that answers, kept that way by a check every minute. Its route check fails closed.
+VPN_DIR = Path('/etc/hometube/vpn')
+VPN_SERVERS = VPN_DIR / 'servers.json'      # root only: the imported servers with their keys
+VPN_STATE = VPN_DIR / 'state.json'
+VPN_IFACE = 'htvpn'
+VPN_TABLE = 52
+VPN_CONF = Path('/etc/wireguard') / f'{VPN_IFACE}.conf'
+VPN_RESOLV = Path('/etc/hometube/resolv.conf')
+VPN_NSSWITCH = Path('/etc/hometube/nsswitch.conf')
+VPN_PUBLIC_PROBES = ('1.1.1.1', '9.9.9.9')
+VPN_FAILS = 3              # checks in a row without any answer through the tunnel before it moves
+VPN_FASTER = 0.75          # a working tunnel moves only for a server a quarter faster...
+VPN_MIN_GAIN = 20.0        # ...and 20 ms faster
+VPN_REMEASURE = 6 * 3600
+VPN_AVOID = 3600           # a server that did not answer is left alone an hour
+VPN_YOUTUBE_AVOID = 24 * 3600
+_WG_KEY = re.compile(r'[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=')
+_HOSTPORT = re.compile(r'\[?([0-9a-fA-F:.]+|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)\]?:([0-9]{1,5})')
+
+
+def parse_wg(text: str) -> dict[str, Any] | None:
+    """One WireGuard config from any provider: its key, IPv4 address, DNS and its single server."""
+    section, iface, peers = None, {}, []
+    for raw in str(text).splitlines():
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith('['):
+            section = line.strip('[]').strip().lower()
+            if section == 'peer':
+                peers.append({})
+            continue
+        if '=' not in line:
+            continue
+        key, value = (x.strip() for x in line.split('=', 1))
+        target = iface if section == 'interface' else peers[-1] if section == 'peer' and peers else None
+        if target is not None:
+            target[key.lower()] = value
+    if len(peers) != 1 or not _WG_KEY.fullmatch(iface.get('privatekey', '')) or not _WG_KEY.fullmatch(peers[0].get('publickey', '')):
+        return None
+    address = [a.strip() for a in iface.get('address', '').split(',') if a.strip() and ':' not in a]
+    try:
+        address = [str(ipaddress.ip_interface(a)) for a in address][:1]
+    except ValueError:
+        return None
+    endpoint = _HOSTPORT.fullmatch(peers[0].get('endpoint', ''))
+    psk = peers[0].get('presharedkey', '')
+    if not address or not endpoint or not 1 <= int(endpoint.group(2)) <= 65535 or (psk and not _WG_KEY.fullmatch(psk)):
+        return None
+    dns = [d.strip() for d in iface.get('dns', '').split(',') if _is_ipv4(d.strip())][:3]
+    return {'private_key': iface['privatekey'], 'address': address[0], 'dns': dns, 'pubkey': peers[0]['publickey'],
+            'psk': psk, 'host': endpoint.group(1), 'port': int(endpoint.group(2))}
+
+
+def _resolve(host: str) -> str | None:
+    if _is_ipv4(host):
+        return host
+    try:
+        return next(i[4][0] for i in __import__('socket').getaddrinfo(host, None, 2))   # AF_INET
+    except (OSError, StopIteration):
+        return None
+
+
+def _read_vpn(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def _write_vpn(path: Path, data: Any) -> None:
+    VPN_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(VPN_DIR, 0o700)
+    tmp = path.with_name('.' + path.name + '.new')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(json.dumps(data, indent=1))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+
+
+def vpn_read_configs(data: bytes, filename: str) -> tuple[list[dict[str, Any]], int]:
+    """The servers in a .conf or a .zip of them. Files that are not usable WireGuard configs are counted."""
+    files = []
+    if data[:2] == b'PK':
+        import io, zipfile
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile:
+            raise ValueError('The zip file is damaged.')
+        entries = [e for e in archive.infolist() if not e.is_dir() and e.filename.endswith('.conf')]
+        if len(entries) > 2000:
+            raise ValueError('The zip holds too many configs.')
+        for e in entries:
+            with archive.open(e) as member:   # read with a limit: a lying header cannot inflate it
+                files.append((os.path.basename(e.filename), member.read(16_001)[:16_000].decode('utf-8', 'replace')))
+    else:
+        files.append((os.path.basename(filename) or 'server.conf', data[:16_000].decode('utf-8', 'replace')))
+    servers, skipped = [], 0
+    for name, text in files:
+        cfg = parse_wg(text)
+        ip = _resolve(cfg['host']) if cfg else None
+        if not cfg or not ip:
+            skipped += 1
+            continue
+        cfg['name'] = re.sub(r'[^A-Za-z0-9_.-]', '-', name[:-5] if name.endswith('.conf') else name)[:60] or 'server'
+        cfg['ip'] = ip
+        servers.append(cfg)
+    return servers, skipped
+
+
+def _ping_ms(ip: str, iface: str | None = None, count: int = 2, wait: int = 2) -> float | None:
+    cmd = ['ping', '-n', '-q', '-c', str(count), '-W', str(wait)] + (['-I', iface] if iface else []) + [ip]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=count * wait + 4).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r'= [0-9.]+/([0-9.]+)/', out)
+    return float(m.group(1)) if m else None
+
+
+def vpn_answers() -> bool:
+    """Any reply through the tunnel: the provider's resolver, then 1.1.1.1, then 9.9.9.9."""
+    targets = list(dict.fromkeys((_read_vpn(VPN_STATE, {}).get('dns') or []) + list(VPN_PUBLIC_PROBES)))
+    return any(_ping_ms(t, VPN_IFACE, count=2, wait=3) is not None for t in targets)
+
+
+def vpn_ranked(servers: list[dict[str, Any]], skip: set) -> list[tuple[float, dict[str, Any]]]:
+    """The servers that answer ping from here, fastest first (measured outside the tunnel)."""
+    pool = [s for s in servers if s['name'] not in skip]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        times = list(ex.map(lambda s: _ping_ms(s['ip']), pool))
+    return sorted(((t, s) for t, s in zip(times, pool) if t is not None), key=lambda x: x[0])
+
+
+def vpn_conf(server: dict[str, Any]) -> str:
+    """The tunnel's config: no table of its own routes but VPN_TABLE, which falls back to unreachable;
+    no DNS line (that would change the whole board's resolver): HomeTube's lookups use `resolvers`."""
+    return (f"[Interface]\n# HomeTube's own tunnel ({server['name']}): only HomeTube's account uses it\n"
+            f"PrivateKey = {server['private_key']}\nAddress = {server['address']}\nTable = off\n"
+            f"PostUp = ip -4 route replace default dev %i table {VPN_TABLE}; ip -4 route replace unreachable default metric 4096 table {VPN_TABLE}\n"
+            f"PreDown = ip -4 route del default dev %i table {VPN_TABLE}\n\n"
+            f"[Peer]\nPublicKey = {server['pubkey']}\n" + (f"PresharedKey = {server['psk']}\n" if server.get('psk') else '') +
+            f"AllowedIPs = 0.0.0.0/0\nEndpoint = {server['ip']}:{server['port']}\nPersistentKeepalive = 25\n")
+
+
+def _vpn_up(server: dict[str, Any]) -> bool:
+    """Bring the tunnel up on this server; True once a reply comes back through it (15 s at most)."""
+    Path('/etc/wireguard').mkdir(mode=0o700, exist_ok=True)
+    tmp = VPN_CONF.with_name('.' + VPN_CONF.name + '.new')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as handle:
+        handle.write(vpn_conf(server))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, VPN_CONF)
+    unit = f'wg-quick@{VPN_IFACE}.service'
+    if subprocess.run(['systemctl', 'restart', unit], capture_output=True, timeout=40).returncode != 0:
+        return False
+    subprocess.run(['systemctl', 'enable', unit], capture_output=True)
+    state = _read_vpn(VPN_STATE, {})
+    state['dns'] = server.get('dns') or []
+    _write_vpn(VPN_STATE, state)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        if vpn_answers():
+            return True
+        time.sleep(1)
+    return False
+
+
+def _set_vpn_settings(on: bool, dns: list[str] | None = None) -> None:
+    """Write the settings that send HomeTube through its tunnel (or back out directly), then the units."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if on:
+        data.update(route_table=VPN_TABLE, route_dev=VPN_IFACE, after_unit=f'wg-quick@{VPN_IFACE}.service',
+                    resolvers=(dns or list(VPN_PUBLIC_PROBES))[:3])
+    else:
+        for key in ('route_table', 'route_dev', 'after_unit', 'resolvers'):
+            data.pop(key, None)
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _write_unit(CONFIG_PATH, json.dumps(data, indent=2) + '\n')
+    CONFIG.clear(); CONFIG.update(load_config(CONFIG_PATH))
+    install_units()
+
+
+def vpn_move(servers: list[dict[str, Any]], current: str | None, why: str, must_move: bool) -> dict[str, Any] | None:
+    """Put the tunnel on the fastest server that works (another one when must_move). None if none did."""
+    state = _read_vpn(VPN_STATE, {})
+    now = time.time()
+    skip = {h for h, t in (state.get('avoid') or {}).items() if t > now} | {h for h, t in (state.get('youtube_avoid') or {}).items() if t > now}
+    ranked = vpn_ranked(servers, skip)
+    times = {s['name']: t for t, s in ranked}
+    state['latency'] = times
+    state['measured_at'] = int(now)
+    _write_vpn(VPN_STATE, state)
+    if not must_move and current in times and ranked and not (ranked[0][0] <= times[current] * VPN_FASTER and times[current] - ranked[0][0] >= VPN_MIN_GAIN):
+        return None   # the current one is fastest enough
+    for ms, server in ranked[:4]:
+        if server['name'] == current and must_move:
+            continue
+        if server['name'] == current:
+            return None
+        if not _vpn_up(server):
+            state = _read_vpn(VPN_STATE, {}); state.setdefault('avoid', {})[server['name']] = int(now + VPN_AVOID); _write_vpn(VPN_STATE, state)
+            continue
+        probe = None
+        if why == 'youtube':
+            try:
+                probe = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{PORT}/api/tv/probe', timeout=120).read())
+            except Exception:
+                probe = None
+            if probe and probe.get('lookup') == 'refused':
+                state = _read_vpn(VPN_STATE, {}); state.setdefault('youtube_avoid', {})[server['name']] = int(now + VPN_YOUTUBE_AVOID); _write_vpn(VPN_STATE, state)
+                continue
+        state = _read_vpn(VPN_STATE, {})
+        state.update(current=server['name'], switched_at=int(time.time()), fails=0)
+        _write_vpn(VPN_STATE, state)
+        return {'server': server['name'], 'latency_ms': round(ms), 'dns': server.get('dns') or []}
+    return None
+
+
+def vpn_import(path: str) -> None:
+    if os.geteuid() != 0:
+        raise SystemExit('run as root')
+    if not shutil_which('wg-quick'):
+        raise SystemExit('WireGuard tools are not installed: sudo apt-get install wireguard-tools')
+    data = Path(path).read_bytes()
+    servers, skipped = vpn_read_configs(data, path)
+    if not servers:
+        raise SystemExit(f'No usable WireGuard config in {path}' + (f' ({skipped} skipped)' if skipped else ''))
+    _write_vpn(VPN_SERVERS, servers)
+    print(f'{len(servers)} server(s) imported' + (f', {skipped} file(s) skipped' if skipped else '') + '; picking the fastest that answers...')
+    moved = vpn_move(servers, None, 'import', must_move=True)
+    if not moved:
+        subprocess.run(['systemctl', 'disable', '--now', f'wg-quick@{VPN_IFACE}.service'], capture_output=True)
+        VPN_CONF.unlink(missing_ok=True)
+        raise SystemExit('No imported server answered through a tunnel; HomeTube stays as it was.')
+    _set_vpn_settings(True, moved['dns'])
+    print(f"HomeTube now goes out through its own tunnel: {moved['server']} ({moved['latency_ms']} ms). "
+          'Checked every minute; it moves to the fastest server that works. `vpn off` sends it out directly again.')
+
+
+def vpn_off() -> None:
+    if os.geteuid() != 0:
+        raise SystemExit('run as root')
+    _set_vpn_settings(False)
+    subprocess.run(['systemctl', 'disable', '--now', f'wg-quick@{VPN_IFACE}.service'], capture_output=True)
+    VPN_CONF.unlink(missing_ok=True)
+    for f in (VPN_RESOLV, VPN_NSSWITCH):
+        f.unlink(missing_ok=True)
+    print('HomeTube goes out directly again (its imported servers are kept: `vpn import` the file again to use them).')
+
+
+def vpn_check() -> str | None:
+    """The minute check (root, from hometube-vpn.timer): keep the tunnel on the fastest server that works."""
+    if CONFIG['route_dev'] != VPN_IFACE or not VPN_CONF.exists():
+        return None
+    servers = _read_vpn(VPN_SERVERS, [])
+    state = _read_vpn(VPN_STATE, {})
+    current = state.get('current')
+    alive = vpn_answers()
+    state['fails'] = 0 if alive else int(state.get('fails') or 0) + 1
+    _write_vpn(VPN_STATE, state)
+    try:
+        st = json.loads(urllib.request.urlopen(f'http://127.0.0.1:{PORT}/api/tv/status', timeout=3).read())
+    except Exception:
+        st = {}
+    refused = (st.get('youtube_refused_at') or 0) > max(state.get('switched_at') or 0, st.get('lookup_ok_at') or 0)
+    dead = state['fails'] >= VPN_FAILS
+    due = time.time() - (state.get('measured_at') or 0) >= VPN_REMEASURE
+    if refused and current:
+        state.setdefault('youtube_avoid', {})[current] = int(time.time() + VPN_YOUTUBE_AVOID)
+        _write_vpn(VPN_STATE, state)
+    if dead and current:
+        state.setdefault('avoid', {})[current] = int(time.time() + VPN_AVOID)
+        _write_vpn(VPN_STATE, state)
+    if not (dead or refused or due):
+        return None
+    moved = vpn_move(servers, current, 'youtube' if refused else 'dead' if dead else 'faster', must_move=dead or refused)
+    if moved and moved['dns'] != CONFIG['resolvers'] and (moved['dns'] or CONFIG['resolvers'] != list(VPN_PUBLIC_PROBES)):
+        _set_vpn_settings(True, moved['dns'])
+    msg = (f"moved to {moved['server']} ({moved['latency_ms']} ms)" if moved
+           else 'no other server answered: the tunnel stays as it is (closed, not around it)' if dead or refused else 'already on the fastest')
+    print(f'[hometube vpn] {msg}', flush=True)
+    return msg
+
+
+def vpn_status() -> None:
+    state = _read_vpn(VPN_STATE, {})
+    servers = _read_vpn(VPN_SERVERS, [])
+    on = CONFIG['route_dev'] == VPN_IFACE
+    try:
+        ht_uid = int(subprocess.run(['id', '-u', USER], capture_output=True, text=True, check=True).stdout)
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        ht_uid = None
+    ok, why = route_status(force=True, uid=ht_uid) if on else (True, '')   # HomeTube's account, not root's
+    print(f"HomeTube's own VPN: {'on' if on else 'off (HomeTube goes out directly, or through the route its settings name)'}")
+    if on:
+        print(f"  server: {state.get('current')} of {len(servers)} imported · answers: {vpn_answers()} · route check: {'ok' if ok else why}")
+        print(f"  lookups resolved by: {', '.join(CONFIG['resolvers']) or '-'} (through the tunnel)")
+
+
+def vpn_check_units() -> dict[str, str]:
+    service = f"""[Unit]
+Description=HomeTube: keep its own tunnel on the fastest server that works
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=HOMETUBE_CONFIG={CONFIG_PATH}
+ExecStart=/usr/bin/python3 {APP_DIR}/hometube.py vpn check
+Nice=10
+"""
+    timer = """[Unit]
+Description=HomeTube: check its own tunnel every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+"""
+    return {f'{UNIT}-vpn.service': service, f'{UNIT}-vpn.timer': timer}
+
+
+def _nsswitch_files_dns() -> str:
+    """The board's nsswitch.conf with names looked up only from files and DNS (the resolvers above),
+    not through a local resolver service that would ask from outside HomeTube's tunnel."""
+    try:
+        lines = Path('/etc/nsswitch.conf').read_text().splitlines()
+    except OSError:
+        lines = []
+    out = [l for l in lines if not l.strip().startswith('hosts:')]
+    return '\n'.join(out + ['hosts: files dns']) + '\n'
+
+
+def shutil_which(name: str) -> str | None:
+    import shutil
+    return shutil.which(name, path='/usr/sbin:/usr/bin:/sbin:/bin')
+
+
 if __name__ == '__main__':
     command, rest = (sys.argv[1:] or [''])[0], sys.argv[2:]
     if command == 'serve':
@@ -1344,5 +1728,13 @@ if __name__ == '__main__':
         install_units()
     elif command == 'cookies':
         cookies_command(rest)
+    elif command == 'vpn' and rest[:1] == ['import'] and len(rest) == 2:
+        vpn_import(rest[1])
+    elif command == 'vpn' and rest == ['off']:
+        vpn_off()
+    elif command == 'vpn' and rest == ['status']:
+        vpn_status()
+    elif command == 'vpn' and rest == ['check']:
+        vpn_check()
     else:
         raise SystemExit(__doc__)
