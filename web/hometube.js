@@ -39,8 +39,9 @@
 
   function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function dur(s) { if (!s && s !== 0) return ''; s = Math.round(s); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60; return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (x < 10 ? '0' : '') + x; }
-  function api(path, payload) {
-    return fetch('/api/tv/' + path, payload ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)} : {})
+  function api(path, payload, keep) {
+    // keep: the request finishes even if the page is closing (the position when the phone locks)
+    return fetch('/api/tv/' + path, payload ? {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload), keepalive: !!keep} : {})
       .then(function (r) { return r.json().then(function (d) { if (!r.ok || d.ok === false) throw new Error(d.error || ('error ' + r.status)); return d; }); });
   }
   function status(text) { $('status').textContent = text || ''; }
@@ -70,8 +71,9 @@
     window.scrollTo(0, 0);
     focusFirst($('grid'));
   }
-  function row(title) {
+  function row(title, key) {
     var sec = document.createElement('section'); sec.className = 'tv-row';
+    if (key) sec.dataset.row = key;
     sec.innerHTML = '<h2>' + esc(title) + '</h2><div class="tv-strip"><div class="tv-track">' + skeleton(6) + '</div></div>';
     $('rows').appendChild(sec);
     return {fill: function (list) {
@@ -80,13 +82,34 @@
       focusFirst($('rows'));
     }, drop: function () { sec.remove(); }};
   }
+  // started and not finished (more than 30 s left), newest first
+  function continueItems(h) {
+    return (h.items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 12);
+  }
+  // after a video closes: the row shows it at the front, with how far you got, without a reload
+  function refreshContinue(lastId) {
+    if ($('rows').hidden) return;
+    api('history').then(function (h) {
+      var list = continueItems(h), sec = $('rows').querySelector('.tv-row[data-row="continue"]');
+      if (!list.length) { if (sec) sec.remove(); return; }
+      if (!sec) {
+        sec = document.createElement('section'); sec.className = 'tv-row'; sec.dataset.row = 'continue';
+        sec.innerHTML = '<h2>Continue watching</h2><div class="tv-strip"><div class="tv-track"></div></div>';
+        $('rows').insertBefore(sec, $('rows').firstChild);
+      }
+      var hadFocus = sec.contains(document.activeElement), strip = sec.querySelector('.tv-strip');
+      trackOf(strip).innerHTML = list.map(card).join('');
+      slide(strip, 0); strip.scrollLeft = 0;
+      if (isTV && hadFocus) focusCard(trackOf(strip).querySelector('.tv-card[data-id="' + lastId + '"]') || trackOf(strip).querySelector('.tv-card'));
+    }).catch(function () {});
+  }
   function loadHome() {
     tab('homeBtn');
     $('list').hidden = true; $('rows').hidden = false; $('rows').innerHTML = '';
     status('');
-    var cont = row('Continue watching');
+    var cont = row('Continue watching', 'continue');
     api('history').then(function (h) {
-      var list = (h.items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 12);
+      var list = continueItems(h);
       cont.fill(list);
       list.slice(0, 2).forEach(function (v) { warm(v.id); });   // the likeliest picks get looked up now
     }).catch(cont.drop);
@@ -209,17 +232,17 @@
   function start() {
     $('video').play().catch(function () { syncPlay(); });
     clearInterval(saveTimer);
-    saveTimer = setInterval(remember, 15000);
+    saveTimer = setInterval(remember, 10000);
   }
-  function remember() {
+  function remember(keep) {   // how far you got: every 10 s, on pause and seek, when the page goes away, on close
     var video = $('video');
-    if (!current || !current.duration && !isFinite(video.duration) || !isFinite(video.currentTime) || !video.currentTime) return;
-    api('history', {item: {id: current.id, title: current.title, channel: current.channel, channel_id: current.channel_id,
-                           position: video.currentTime, duration: video.duration || current.duration}}).catch(function () {});
+    if (!current || !current.hls || !current.duration && !isFinite(video.duration) || !isFinite(video.currentTime) || !video.currentTime) return Promise.resolve();
+    return api('history', {item: {id: current.id, title: current.title, channel: current.channel, channel_id: current.channel_id,
+                                  position: video.currentTime, duration: isFinite(video.duration) ? video.duration : current.duration}}, keep).catch(function () {});
   }
   function teardown() {
     clearInterval(saveTimer); cancelUpNext();
-    if (current && current.hls) remember();
+    var saved = remember();
     var video = $('video');
     video.pause();
     if (hls) { hls.destroy(); hls = null; }
@@ -227,6 +250,7 @@
     while (video.firstChild) video.removeChild(video.firstChild);
     setProgress(0, 0, 0);
     setMore(false);
+    return saved;
   }
   // closing goes through the browser history, so the phone's back gesture and Back do the same thing
   function closePlayer() {
@@ -235,17 +259,19 @@
   }
   function reallyClose() {
     if (!inPlayer()) return;
-    teardown();
-    opening++;
     var last = current;
+    var saved = teardown();
+    opening++;
     current = null; played = [];
     try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(function () {}); } catch (e) { /* none */ }
     $('player').hidden = true;
     body.classList.remove('playing');
     window.scrollTo(0, homeScroll);
-    if (!isTV) return;
-    var c = last && document.querySelector('#rows:not([hidden]) .tv-card[data-id="' + last.id + '"], #list:not([hidden]) .tv-card[data-id="' + last.id + '"]');
-    focusCard(c || lastCard || $('q'));
+    if (isTV) {
+      var c = last && document.querySelector('#rows:not([hidden]) .tv-card[data-id="' + last.id + '"], #list:not([hidden]) .tv-card[data-id="' + last.id + '"]');
+      focusCard(c || lastCard || $('q'));
+    }
+    if (last) saved.then(function () { refreshContinue(last.id); });   // once the position is stored
   }
   window.addEventListener('popstate', function () { if (inPlayer()) reallyClose(); });
   function nextId() {
@@ -661,7 +687,10 @@
   var video = $('video');
   video.addEventListener('waiting', function () { spinner('Loading…'); });
   video.addEventListener('playing', function () { spinner(null); status(''); syncPlay(); wake(); });
-  video.addEventListener('pause', function () { syncPlay(); wake(true); });
+  video.addEventListener('pause', function () { syncPlay(); wake(true); remember(); });
+  video.addEventListener('seeked', function () { remember(); });
+  document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') remember(true); });
+  window.addEventListener('pagehide', function () { remember(true); });
   video.addEventListener('play', syncPlay);
   video.addEventListener('timeupdate', function () {
     var b = video.buffered, end = b && b.length ? b.end(b.length - 1) : 0;
