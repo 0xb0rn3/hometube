@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f10">
+<meta name="robots" content="noindex">
+<title>__HOMETUBE_TITLE__</title>
+<link rel="icon" type="image/svg+xml" href="/assets/hometube/mark.svg">
+<link rel="stylesheet" href="/assets/hometube/hometube.css">
+<script src="/assets/hometube/hometube.js" data-hls="/assets/hometube/hls.min.js" defer></script>
+</head>
+<body>
+<header class="tv-top">
+  <div class="tv-brand"><svg class="tv-mark" viewBox="0 0 32 32" aria-hidden="true"><path class="house" d="M16 2.5 29.5 13.2V26a3.5 3.5 0 0 1-3.5 3.5H6A3.5 3.5 0 0 1 2.5 26V13.2Z"/><path class="play" d="M13 13.2v10.6l8.6-5.3Z"/></svg><span>HomeTube</span></div>
+  <form id="searchForm" class="tv-search" role="search" autocomplete="off">
+    <button type="button" id="searchClose" class="tv-icon" aria-label="Close search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
+    <input id="q" type="search" placeholder="Search" data-nav aria-label="Search" enterkeyhint="search">
+    <button type="submit" class="tv-icon" data-nav aria-label="Search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg></button>
+  </form>
+  <button type="button" id="searchOpen" class="tv-icon" aria-label="Search"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg></button>
+  <nav class="tv-tabs" aria-label="Sections">
+    <button type="button" id="homeBtn" data-nav class="on"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg><span>Home</span></button>
+    <button type="button" id="recBtn" data-nav hidden><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2l2.4 6.9H22l-6 4.6 2.3 7L12 16.3 5.7 20.5 8 13.5 2 8.9h7.6z"/></svg><span>For you</span></button>
+    <button type="button" id="historyBtn" data-nav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 2.05 4.95l-1.42 1.42A9 9 0 1 0 13 3zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z"/></svg><span>History</span></button>
+    <button type="button" id="laterBtn" data-nav><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg><span>Watch Later</span></button>
+  </nav>
+</header>
+<main>
+  <p id="status" class="tv-status" aria-live="polite">Loading…</p>
+  <div id="rows" class="tv-rows"></div>
+  <section id="list" class="tv-list" hidden>
+    <h2 id="rowTitle"></h2>
+    <div id="grid" class="tv-grid"></div>
+  </section>
+</main>
+<div id="player" class="tv-player" hidden>
+  <div class="tv-stage" id="stage">
+    <video id="video" playsinline preload="auto"></video>
+    <div id="spin" class="tv-spin" hidden><i></i><span id="spinText">Opening…</span></div>
+    <button type="button" id="backFab" class="tv-fab" aria-label="Back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg></button>
+  </div>
+  <div id="dock" class="tv-dock">
+    <div class="tv-details">
+      <h3 id="vTitle"></h3>
+      <p class="tv-sub"><span id="vChannel"></span><span id="vQueue"></span></p>
+      <div class="tv-progress" aria-hidden="true"><span id="tCur">0:00</span><div class="tv-track-bar"><i id="tBuf"></i><i id="tPos"></i></div><span id="tDur">0:00</span></div>
+      <div class="tv-actions">
+      <div class="tv-controls">
+        <div class="tv-transport">
+          <button type="button" id="prevBtn" class="tv-round" data-pnav aria-label="Previous video"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6h2v12H6zm3.5 6 8.5 6V6z"/></svg><span class="lbl">Previous</span></button>
+          <button type="button" id="backTen" class="tv-round tv-seek" data-pnav aria-label="Back 10 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11.99 5V1l-5 5 5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6h-2c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z"/></svg><span class="lbl">−10 s</span></button>
+          <button type="button" id="playBtn" class="tv-round tv-main" data-pnav aria-label="Pause"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="playIcon" d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg><span class="lbl" id="playLabel">Pause</span></button>
+          <button type="button" id="fwdTen" class="tv-round tv-seek" data-pnav aria-label="Forward 10 seconds"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12.01 5V1l5 5-5 5V7c-3.31 0-6 2.69-6 6s2.69 6 6 6 6-2.69 6-6h2c0 4.42-3.58 8-8 8s-8-3.58-8-8 3.58-8 8-8z"/></svg><span class="lbl">+10 s</span></button>
+          <button type="button" id="nextBtn" class="tv-round" data-pnav aria-label="Next video"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"/></svg><span class="lbl">Next</span></button>
+        </div>
+        <div class="tv-side">
+          <button type="button" id="mixBtn" class="tv-round" data-pnav aria-label="Mix"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 6H3v2h12V6zm0 4H3v2h12v-2zM3 16h8v-2H3v2zM17 6v8.18A2.99 2.99 0 0 0 16 14a3 3 0 1 0 3 3V8h3V6h-5z"/></svg><span class="lbl" id="mixLabel">Mix</span></button>
+          <button type="button" id="moreBtn" class="tv-round tv-tv-only" data-pnav aria-label="More" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z"/></svg><span class="lbl">More</span></button>
+          <button type="button" id="fsBtn" class="tv-round tv-tv-only" data-pnav aria-label="Exit full screen"><svg viewBox="0 0 24 24" aria-hidden="true"><path id="fsIcon" d="M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"/></svg><span class="lbl" id="fsLabel">Exit full screen</span></button>
+          <button type="button" id="closeBtn" class="tv-round tv-tv-only" data-pnav aria-label="Back"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/></svg><span class="lbl">Back</span></button>
+        </div>
+      </div>
+      <div id="more" class="tv-chips">
+        <button type="button" id="subBtn" class="tv-chip" data-pnav>Subscribe</button>
+        <button type="button" id="laterAdd" class="tv-chip" data-pnav>Watch Later</button>
+        <button type="button" id="channelBtn" class="tv-chip" data-pnav>Channel</button>
+        <button type="button" id="qBtn" class="tv-chip" data-pnav>Quality <b id="qLabel">Auto</b></button>
+        <button type="button" id="speedBtn" class="tv-chip" data-pnav>Speed <b id="speedLabel">1×</b></button>
+        <button type="button" id="ccBtn" class="tv-chip" data-pnav>Subtitles <b id="ccLabel">Off</b></button>
+        <button type="button" id="chapBtn" class="tv-chip" data-pnav hidden>Next chapter</button>
+      </div>
+      </div>
+    </div>
+    <section class="tv-related">
+      <div class="tv-lower-tabs" role="tablist">
+        <button type="button" id="tabQueue" data-pnav role="tab">Queue</button>
+        <button type="button" id="tabNext" data-pnav role="tab">Up next</button>
+      </div>
+      <div id="queueStrip" class="tv-strip tv-rel" hidden><div class="tv-track"></div></div>
+      <div id="relStrip" class="tv-strip tv-rel" hidden><div class="tv-track"></div></div>
+    </section>
+  </div>
+  <div id="upnext" class="tv-upnext" hidden><span>Up next in <b id="upnextSec">5</b></span><strong id="upnextTitle"></strong><small id="upnextHint">OK: play now · Back: stay</small></div>
+</div>
+</body>
+</html>
