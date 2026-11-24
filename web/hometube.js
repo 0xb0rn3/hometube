@@ -50,7 +50,7 @@
   }
 
   var current = null, hls = null, dockTimer = null, saveTimer = null, warmTimer = null, upTimer = null, retryTimer = null;
-  var subs = [], account = false, items = {}, warmed = {}, TOPICS = [];
+  var subs = [], account = false, items = {}, warmed = {}, TOPICS = [], MUSIC = [], rowsToken = 0;
   var queue = [], qi = -1, queueName = '', played = [], related = [], full = true, homeScroll = 0, lastCard = null, opening = 0;
 
   function esc(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
@@ -73,7 +73,7 @@
       badge + progress + '</div><div class="meta"><div class="t">' + esc(v.title) + '</div><div class="c">' + esc(v.channel || '') + '</div></div></article>';
   }
   function skeleton(n) { var out = ''; for (var i = 0; i < n; i++) out += '<div class="tv-card tv-skel"><div class="thumb"></div><div class="meta"><div class="t"></div></div></div>'; return out; }
-  function tab(id) { ['homeBtn', 'recBtn', 'historyBtn', 'laterBtn'].forEach(function (b) { $(b).classList.toggle('on', b === id); }); }
+  function tab(id) { ['homeBtn', 'musicBtn', 'recBtn', 'historyBtn', 'laterBtn'].forEach(function (b) { $(b).classList.toggle('on', b === id); }); }
   function focusFirst(scope, opened) {
     if (!isTV || inPlayer()) return;   // touch and mouse: nothing to focus, it would only show a ring
     var f = scope.querySelector('.tv-card[data-nav]'), a = document.activeElement;
@@ -101,13 +101,13 @@
       focusFirst($('rows'));
     }, drop: function () { sec.remove(); }};
   }
-  // started and not finished (more than 30 s left), newest first
+  // started and not finished (more than 30 s left), newest first; songs are on the Music tab instead
   function continueItems(h) {
-    return (h.items || []).filter(function (v) { return v.position && v.duration && v.position < v.duration - 30; }).slice(0, 12);
+    return (h.items || []).filter(function (v) { return !v.music && v.position && v.duration && v.position < v.duration - 30; }).slice(0, 12);
   }
   // after a video closes: the row shows it at the front, with how far you got, without a reload
   function refreshContinue(lastId) {
-    if ($('rows').hidden) return;
+    if ($('rows').hidden || stack[stack.length - 1].kind !== 'home') return;
     api('history').then(function (h) {
       var list = continueItems(h), sec = $('rows').querySelector('.tv-row[data-row="continue"]');
       if (!list.length) { if (sec) sec.remove(); return; }
@@ -126,7 +126,7 @@
     tab('homeBtn');
     $('list').hidden = true; $('rows').hidden = false; $('rows').innerHTML = '';
     status('');
-    var waits = [];
+    var token = ++rowsToken, waits = [];
     var cont = row('Continue watching', 'continue');
     waits.push(api('history').then(function (h) {
       var list = continueItems(h);
@@ -138,10 +138,40 @@
       if (d.subscriptions) subs = d.subscriptions;
       subsRow.fill(d.items || []);
     }).catch(subsRow.drop));
-    TOPICS.forEach(function (t) {   // the board keeps these warm, so they come straight back
+    topicRows(TOPICS, 'media', waits);
+    becauseRows('media', token);
+    return Promise.all(waits);
+  }
+  // the board keeps these warm, so they come straight back; kind: "media" leaves music out, "music" keeps only music
+  function topicRows(list, kind, waits) {
+    list.forEach(function (t) {
       var r = row(t[0]);
-      waits.push(api('search?q=' + encodeURIComponent(t[1]) + '&topic=1').then(function (d) { r.fill((d.items || []).slice(0, 16)); }).catch(r.drop));
+      waits.push(api('search?q=' + encodeURIComponent(t[1]) + '&topic=1&kind=' + kind).then(function (d) { r.fill((d.items || []).slice(0, 16)); }).catch(r.drop));
     });
+  }
+  // under the rows: what YouTube puts next to what you watched (or listened to) lately
+  function becauseRows(kind, token) {
+    api('because?kind=' + kind).then(function (d) {
+      if (token !== rowsToken) return;   // another tab is open by now
+      (d.rows || []).forEach(function (b) {
+        var name = b.title.length > 60 ? b.title.slice(0, 57) + '…' : b.title;
+        row((kind === 'music' ? 'Because you listened to ' : 'Because you watched ') + name).fill(b.items || []);
+      });
+    }).catch(function () {});
+  }
+  function loadMusic() {
+    tab('musicBtn');
+    $('list').hidden = true; $('rows').hidden = false; $('rows').innerHTML = '';
+    status('');
+    var token = ++rowsToken, waits = [];
+    var recent = row('Recently played', 'recent');
+    waits.push(api('history').then(function (h) {
+      var list = (h.items || []).filter(function (v) { return v.music; }).slice(0, 16);
+      recent.fill(list);
+      list.slice(0, 2).forEach(function (v) { warm(v.id); });
+    }).catch(recent.drop));
+    topicRows(MUSIC, 'music', waits);
+    becauseRows('music', token);
     return Promise.all(waits);
   }
   function search(q) {
@@ -158,10 +188,11 @@
   // ---- where you are: Home, then whatever was opened from it. Back steps back through that, on the
   // remote and with the phone's back gesture, instead of the browser leaving for the previous address.
   var stack = [{kind: 'home'}], exitArmed = 0;
-  var TABS = {home: 'homeBtn', history: 'historyBtn', later: 'laterBtn', rec: 'recBtn'};
+  var TABS = {home: 'homeBtn', music: 'musicBtn', history: 'historyBtn', later: 'laterBtn', rec: 'recBtn'};
   function render(v, focusId) {
     var done;
     if (v.kind === 'home') done = loadHome();
+    else if (v.kind === 'music') done = loadMusic();
     else if (v.kind === 'search') done = runList('Results for "' + v.q + '"', 'search?q=' + encodeURIComponent(v.q), 'Searching…');
     else if (v.kind === 'channel') done = runList(v.name || 'Channel', 'channel?id=' + encodeURIComponent(v.id), 'Loading channel…');
     else if (v.kind === 'history') done = runList('History', 'history');
@@ -316,8 +347,11 @@
   function remember(keep) {   // how far you got: every 10 s, on pause and seek, when the page goes away, on close
     var video = $('video');
     if (!current || !current.hls || !current.duration && !isFinite(video.duration) || !isFinite(video.currentTime) || !video.currentTime) return Promise.resolve();
-    return api('history', {item: {id: current.id, title: current.title, channel: current.channel, channel_id: current.channel_id,
-                                  position: video.currentTime, duration: isFinite(video.duration) ? video.duration : current.duration}}, keep).catch(function () {});
+    var item = {id: current.id, title: current.title, channel: current.channel, channel_id: current.channel_id,
+                position: video.currentTime, duration: isFinite(video.duration) ? video.duration : current.duration};
+    var card = items[current.id];   // the card it was opened from knows if it is music (YouTube's artist badge)
+    if (card && typeof card.music === 'boolean') item.music = card.music;
+    return api('history', {item: item}, keep).catch(function () {});
   }
   function teardown() {
     clearInterval(saveTimer); cancelUpNext(); clearTimeout(retryTimer);
@@ -744,6 +778,7 @@
   $('searchOpen').addEventListener('click', openSearch);
   $('searchClose').addEventListener('click', closeSearch);
   $('homeBtn').addEventListener('click', function () { navigate({kind: 'home'}); });
+  $('musicBtn').addEventListener('click', function () { navigate({kind: 'music'}); });
   $('historyBtn').addEventListener('click', function () { navigate({kind: 'history'}); });
   $('laterBtn').addEventListener('click', function () { navigate({kind: 'later'}); });
   $('recBtn').addEventListener('click', function () { navigate({kind: 'rec'}); });
@@ -797,7 +832,7 @@
   });
   video.addEventListener('ended', function () { remember(); syncPlay(); upNext(); });
   Promise.all([
-    api('config').then(function (c) { TOPICS = c.rows || []; }).catch(function () {}),
+    api('config').then(function (c) { TOPICS = c.rows || []; MUSIC = c.music_rows || []; }).catch(function () {}),
     api('account').then(function (d) { account = !!d.connected; $('recBtn').hidden = !account; }).catch(function () {})
   ]).then(function () { render(stack[0]); });
 })();

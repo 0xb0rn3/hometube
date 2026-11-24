@@ -282,11 +282,12 @@ class WarmRowsTests(unittest.TestCase):
             calls.append(query); return [{'id': 'aaaaaaaaaaa'}]
         class Stop(Exception):
             pass
-        with mock.patch.dict(ht.CONFIG, {'rows': [['Chill', 'lofi']]}), mock.patch.object(ht, 'search_direct', side_effect=fake_make), \
-             mock.patch.object(ht.time, 'sleep', side_effect=[None, Stop()]):
+        with mock.patch.dict(ht.CONFIG, {'rows': [['Chill', 'lofi']], 'music_rows': [['Bongo Flava', 'bongo flava']]}), \
+             mock.patch.object(ht, 'search_direct', side_effect=fake_make), \
+             mock.patch.object(ht.time, 'sleep', side_effect=[None, None, Stop()]):
             with self.assertRaises(Stop):
                 ht.keep_rows_warm()
-        self.assertEqual(calls, ['lofi'])
+        self.assertEqual(calls, ['lofi', 'bongo flava'])   # Home's rows and the Music tab's
         self.assertEqual(ht._cache['s:lofi:24'][1], [{'id': 'aaaaaaaaaaa'}])   # replaced, fresh
 
 

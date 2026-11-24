@@ -9,8 +9,11 @@ KickPi K2B, Allwinner H618, Armbian on Debian 13). There are no Shorts anywhere.
 
 ## What it does
 
-- Home rows you choose, subscriptions, a channel's latest videos, search, History, Watch Later,
-  Continue watching (resumes where you stopped)
+- Home: rows of regular videos you choose, subscriptions, Continue watching (resumes where you
+  stopped), then rows of what YouTube suggests next to what you watched lately
+- Music: music only (YouTube's official artist channels, "- Topic" and VEVO channels, titles that say
+  so): Recently played, rows of genres you choose, then rows from what you listened to
+- Search, a channel's latest videos, History, Watch Later
 - Player: previous, back 10 s, play/pause, forward 10 s, next, full screen or windowed, quality (it
   starts at the highest), speed, subtitles, chapters
 - Queue: the row, search or list you opened a video from plays in order, shown as "Row · 5 of 16".
@@ -101,7 +104,8 @@ curl -s http://127.0.0.1:8890/api/tv/status
 | `account_via` | `home` | the way out of the YouTube account's own lists: `home` or `tunnel` (see below) |
 | `after_unit` | none | start after this unit |
 | `label` | none | shown after "HomeTube" in the page title |
-| `rows` | a few general rows | home rows: `[["Title", "search words"], ...]` |
+| `rows` | general rows (news, sports, comedy...) | Home's rows, regular videos (music is left out): `[["Title", "search words"], ...]` |
+| `music_rows` | genres and mixes | the Music tab's rows, music only: `[["Bongo Flava", "bongo flava new songs"], ...]` |
 
 After changing it: `sudo systemctl restart hometube`.
 

@@ -47,12 +47,18 @@ from pathlib import Path
 from typing import Any
 
 CONFIG_PATH = Path(os.environ.get('HOMETUBE_CONFIG', '/etc/hometube/config.json'))
-DEFAULT_ROWS = [['Music', 'official music video'], ['Live now', 'live stream'], ['Chill', 'lofi hip hop'],
-                ['Tech', 'tech review'], ['News', 'world news today'], ['Comedy', 'stand up comedy'], ['Science', 'science documentary']]
+# Home: regular videos (music is left out of these rows); the Music tab: music only
+DEFAULT_ROWS = [['Live now', 'live stream'], ['News', 'world news today'], ['Sports', 'sports highlights'],
+                ['Comedy', 'stand up comedy'], ['Movies & trailers', 'official trailer'], ['Tech', 'tech review'],
+                ['Science', 'science explained'], ['Documentaries', 'documentary'], ['Food', 'cooking recipe']]
+DEFAULT_MUSIC_ROWS = [['New music', 'new official music video'], ['Pop', 'pop music video'], ['Hip hop', 'hip hop music video'],
+                      ['R&B', 'rnb music video'], ['Afrobeats', 'afrobeats new songs'], ['Amapiano', 'amapiano new songs'],
+                      ['Latin', 'latin music video'], ['Rock', 'rock music video'], ['Electronic', 'electronic music video'],
+                      ['Mixes', 'dj mix'], ['Chill', 'lofi hip hop']]
 DEFAULTS: dict[str, Any] = {'bind': '127.0.0.1', 'port': 8891, 'app_dir': '/opt/hometube', 'state_dir': '/var/lib/hometube',
                             'user': 'hometube', 'route_table': None, 'route_pref': 91, 'route_dev': '', 'after_unit': '', 'label': '',
                             'resolvers': [], 'account_via': 'home',
-                            'rows': DEFAULT_ROWS}
+                            'rows': DEFAULT_ROWS, 'music_rows': DEFAULT_MUSIC_ROWS}
 _UNIT_NAME = re.compile(r'[A-Za-z0-9@._-]{1,120}')
 _ACCOUNT = re.compile(r'[a-z_][a-z0-9_-]{0,31}')
 _IFACE = re.compile(r'[A-Za-z0-9_.-]{1,15}')
@@ -101,10 +107,11 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
         raise ValueError('after_unit must be a unit name')
     if not isinstance(cfg['label'], str) or len(cfg['label']) > 80 or any(c in cfg['label'] for c in '<>&"\n'):
         raise ValueError('label must be plain text, 80 characters at most')
-    rows = cfg['rows']
-    if not isinstance(rows, list) or len(rows) > 20 or not all(
-            isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) and 0 < len(x) <= 80 for x in r) for r in rows):
-        raise ValueError('rows must be up to 20 [title, search words] pairs')
+    for key in ('rows', 'music_rows'):
+        rows = cfg[key]
+        if not isinstance(rows, list) or len(rows) > 20 or not all(
+                isinstance(r, list) and len(r) == 2 and all(isinstance(x, str) and 0 < len(x) <= 80 for x in r) for r in rows):
+            raise ValueError(f'{key} must be up to 20 [title, search words] pairs')
     return cfg
 
 
@@ -336,6 +343,26 @@ def _is_short(url: str) -> bool:
     return '/shorts/' in str(url or '')
 
 
+MUSIC_TITLE = re.compile(r'\b(official (music |lyrics? )?video|official audio|\(audio\)|lyrics?|visuali[sz]er|clip officiel|music video|'
+                         r'mix(tape)?|remix|ft\.?|feat\.?|prod\.? by|live (performance|session)|acoustic|cover song|dj)\b', re.I)
+
+
+def _is_music(title: str, channel: str = '', artist: bool = False) -> bool:
+    """Music, judged as YouTube marks it: an official artist channel, an auto-made "- Topic" or VEVO
+    channel, or a title that says it (official video, lyrics, visualizer, mix, ft. ...)."""
+    channel = str(channel or '')
+    return bool(artist or channel.endswith(' - Topic') or channel.upper().endswith('VEVO') or MUSIC_TITLE.search(str(title or '')))
+
+
+def by_kind(items: list[dict[str, Any]], kind: str) -> list[dict[str, Any]]:
+    """kind "music": music only; "media": everything but music; anything else: all."""
+    if kind == 'music':
+        return [i for i in items if i.get('music')]
+    if kind == 'media':
+        return [i for i in items if not i.get('music')]
+    return items
+
+
 def _thumb(video_id: str) -> str:
     return f'https://i.ytimg.com/vi/{video_id}/hqdefault.jpg'
 
@@ -357,8 +384,10 @@ def search_direct(query: str, count: int) -> list[dict[str, Any]]:
         owner = (v.get('ownerText') or v.get('longBylineText') or {}).get('runs') or [{}]
         cid = ((owner[0].get('navigationEndpoint') or {}).get('browseEndpoint') or {}).get('browseId')
         length = _text(v.get('lengthText'))
-        out.append({'id': vid, 'title': _text(v.get('title'))[:200],
-                    'channel': str(owner[0].get('text') or '')[:80],
+        artist = any('VERIFIED_ARTIST' in str((b.get('metadataBadgeRenderer') or {}).get('style') or '') for b in v.get('ownerBadges') or [])
+        title, chan = _text(v.get('title'))[:200], str(owner[0].get('text') or '')[:80]
+        out.append({'id': vid, 'title': title, 'music': _is_music(title, chan, artist),
+                    'channel': chan,
                     'channel_id': cid if CHANNEL_ID.fullmatch(str(cid or '')) else None,
                     'duration': _duration_seconds(length) if length else None,
                     'views': _text(v.get('viewCountText'))[:40],
@@ -388,7 +417,8 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
         for e in data.get('entries') or []:
             vid = e.get('id') or ''
             if VIDEO_ID.fullmatch(vid) and not _is_short(e.get('url')):
-                out.append({'id': vid, 'title': str(e.get('title') or '')[:200], 'channel': str(e.get('channel') or e.get('uploader') or '')[:80],
+                title, chan = str(e.get('title') or '')[:200], str(e.get('channel') or e.get('uploader') or '')[:80]
+                out.append({'id': vid, 'title': title, 'channel': chan, 'music': _is_music(title, chan),
                             'channel_id': e.get('channel_id') if CHANNEL_ID.fullmatch(str(e.get('channel_id') or '')) else None,
                             'duration': e.get('duration'), 'views': e.get('view_count'), 'thumb': _thumb(vid)})
         return out
@@ -494,7 +524,7 @@ def _lockup_video(lv: dict[str, Any]) -> dict[str, Any] | None:
             live = True
     if not title:
         return None
-    return {'id': vid, 'title': title[:200], 'channel': channel[:80], 'channel_id': None,
+    return {'id': vid, 'title': title[:200], 'channel': channel[:80], 'channel_id': None, 'music': _is_music(title, channel),
             'duration': duration, 'live': live, 'thumb': _thumb(vid)}
 
 
@@ -516,6 +546,25 @@ def related(video_id: str) -> list[dict[str, Any]]:
                 out.append(item)
         return out[:24]
     return _cached(f'r:{video_id}', 1800, make)
+
+
+def because(kind: str, seeds: int = 4, per_seed: int = 16) -> list[dict[str, Any]]:
+    """Rows for the end of Home (kind "media") and Music ("music"): for the last few things watched of
+    that kind, what YouTube puts next to them, without what was already watched."""
+    history = get_list('history')
+    seen = {i['id'] for i in history}
+    picked = [i for i in history if bool(i.get('music', _is_music(i.get('title'), i.get('channel')))) == (kind == 'music')][:seeds]
+    rows, shown = [], set()
+    for item in picked:
+        try:
+            near = related(item['id'])
+        except Exception:
+            continue
+        fresh = [v for v in by_kind(near, kind) if v['id'] not in seen and v['id'] not in shown][:per_seed]
+        if len(fresh) >= 4:
+            shown.update(v['id'] for v in fresh)
+            rows.append({'title': item.get('title') or '', 'items': fresh})
+    return rows
 
 
 LIST_ID = re.compile(r'(?:RD|PL|OL|UU|FL|LL)[A-Za-z0-9_-]{8,64}')
@@ -867,9 +916,14 @@ def _list_path(name: str) -> Path:
 def get_list(name: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(_list_path(name).read_text())
-        return data if isinstance(data, list) else []
     except (OSError, ValueError):
         return []
+    if not isinstance(data, list):
+        return []
+    for i in data:   # saved before music was told apart
+        if isinstance(i, dict) and 'music' not in i:
+            i['music'] = _is_music(i.get('title'), i.get('channel'))
+    return [i for i in data if isinstance(i, dict)]
 
 
 def put_item(name: str, item: dict[str, Any], remove: bool = False) -> list[dict[str, Any]]:
@@ -881,7 +935,8 @@ def put_item(name: str, item: dict[str, Any], remove: bool = False) -> list[dict
     if not remove:
         clean = {'id': vid, 'title': str(item.get('title') or '')[:200], 'channel': str(item.get('channel') or '')[:80],
                  'channel_id': item.get('channel_id') if CHANNEL_ID.fullmatch(str(item.get('channel_id') or '')) else None,
-                 'thumb': _thumb(vid), 'at': int(time.time())}
+                 'thumb': _thumb(vid), 'at': int(time.time()),
+                 'music': bool(item['music']) if isinstance(item.get('music'), bool) else _is_music(item.get('title'), item.get('channel'))}
         for key in ('position', 'duration'):
             if isinstance(item.get(key), (int, float)) and 0 <= item[key] < 10**6:
                 clean[key] = round(float(item[key]), 1)
@@ -1166,7 +1221,7 @@ ROW_REFRESH = 45 * 60   # the rows are kept an hour: refreshed before they run o
 def keep_rows_warm() -> None:
     """Look the home rows up now and every 45 minutes, so opening home never waits on YouTube."""
     while True:
-        for _title, words in CONFIG['rows']:
+        for _title, words in CONFIG['rows'] + CONFIG['music_rows']:
             try:
                 search(words, count=24, ttl=3600, background=True, force=True)
             except Exception:
@@ -1292,7 +1347,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if name == 'search':
                 # the home page's rows change slowly: keep them an hour
-                self.reply(200, {'ok': True, 'items': search(q.get('q', ''), ttl=3600 if q.get('topic') == '1' else 600, background=q.get('topic') == '1')})
+                found = search(q.get('q', ''), ttl=3600 if q.get('topic') == '1' else 600, background=q.get('topic') == '1')
+                self.reply(200, {'ok': True, 'items': by_kind(found, q.get('kind', ''))})
             elif name == 'status':
                 if not self.local():
                     self.reply(403, {'ok': False, 'error': 'status is shown on the board only'})
@@ -1308,7 +1364,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self.reply(200, probe())
             elif name == 'config':
-                self.reply(200, {'ok': True, 'label': CONFIG['label'], 'rows': CONFIG['rows']})
+                self.reply(200, {'ok': True, 'label': CONFIG['label'], 'rows': CONFIG['rows'], 'music_rows': CONFIG['music_rows']})
             elif name == 'video':
                 v = video(q.get('id', ''))
                 # the TV gets the relay's playlist, never the googlevideo address (which it cannot read)
@@ -1332,6 +1388,8 @@ class Handler(BaseHTTPRequestHandler):
             elif name == 'account':
                 d = account_call({'op': 'status'}, timeout=3)   # no addresses here: the page is on the network
                 self.reply(200, {'ok': True, 'connected': bool(d.get('connected')), 'via': d.get('via'), 'paused': d.get('paused')})
+            elif name == 'because':
+                self.reply(200, {'ok': True, 'rows': because('music' if q.get('kind') == 'music' else 'media')})
             elif name == 'feed':
                 self.reply(200, {'ok': True, 'items': account_feed(q.get('name', ''))})
             elif name == 'captions':
