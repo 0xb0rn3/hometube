@@ -84,8 +84,12 @@ class LookupTests(Case):
              mock.patch.object(ht, '_ytdlp', return_value=YT) as run:
             out = ht.account_video('aaaaaaaaaaa')
         self.assertEqual(run.call_args.kwargs['cookies'], ht.COOKIES)
+        self.assertIn('youtube:player_client=web_safari', run.call_args.args[0])   # the client that gives HLS signed in
         self.assertFalse(run.call_args.kwargs['route'])          # home: not the tunnel
         self.assertEqual(out['video']['hls'], YT['formats'][0]['manifest_url'])
+        with mock.patch.object(ht, 'youtube_sees', return_value='198.51.100.7'), mock.patch.object(ht, '_ytdlp', return_value={'formats': []}):
+            with self.assertRaisesRegex(ValueError, 'no stream'):
+                ht.account_video('aaaaaaaaaaa')                   # nothing playable: an error, not a cached dead video
         tunnel = {'route_table': 201, 'route_dev': 'mullvad2', 'account_via': 'tunnel'}
         ht._save_account_state({'pin': '203.0.113.10'})
         with mock.patch.dict(ht.CONFIG, tunnel), mock.patch.object(ht, 'youtube_sees', return_value='203.0.113.20'), \

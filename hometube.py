@@ -1142,9 +1142,13 @@ def account_video(video_id: str) -> dict[str, Any]:
     ok, why = account_check()
     if not ok:
         raise RuntimeError(f'Your YouTube account is paused: {why}. It resumes by itself.')
-    d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'], timeout=120, cookies=COOKIES,
-               route=account_via() == 'tunnel', home=ACCOUNT_DIR)
+    # signed in, yt-dlp's default player clients get no HLS stream (measured: separate audio and video
+    # files only); the web_safari client gets HLS, which the TV's player needs
+    d = _ytdlp(['--extractor-args', 'youtube:player_client=web_safari', f'https://www.youtube.com/watch?v={video_id}'], timeout=120,
+               cookies=COOKIES, route=account_via() == 'tunnel', home=ACCOUNT_DIR)
     info, caps = _video_from(d, video_id)
+    if not info['hls']:
+        raise ValueError('YouTube gave no stream the TV can play for this video, even signed in.')
     return {'video': info, 'captions': [[lang, auto, url] for (lang, auto), url in caps.items()]}
 
 
