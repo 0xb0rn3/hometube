@@ -98,6 +98,7 @@ curl -s http://127.0.0.1:8890/api/tv/status
 | `route_pref` | `91` | priority of that rule |
 | `route_dev` | none | interface the traffic must leave by (fails closed) |
 | `resolvers` | none | DNS servers for HomeTube's own lookups (set by `vpn import`) |
+| `account_via` | `home` | the way out of the YouTube account's own lists: `home` or `tunnel` (see below) |
 | `after_unit` | none | start after this unit |
 | `label` | none | shown after "HomeTube" in the page title |
 | `rows` | a few general rows | home rows: `[["Title", "search words"], ...]` |
@@ -111,10 +112,36 @@ signing out), copy it to the board and run:
 
 ```sh
 sudo python3 /opt/hometube/hometube.py cookies cookies.txt     # --clear to disconnect
+python3 /opt/hometube/hometube.py account status
 ```
 
-Only YouTube and Google cookies are kept, readable by HomeTube's account alone. The page on the
-network cannot set or read them.
+Only YouTube and Google cookies are kept. The page on the network cannot set or read them.
+
+Google can flag or lock an account it suddenly sees from another country, and a VPN that moves between
+servers would show it from a new one each time. So:
+
+- **Videos never use the account.** Playing, searching and the home rows are looked up without it, so
+  they can go out by whatever server a VPN picks.
+- **Only the account service holds the cookies**: a separate service (`hometube-account`) under its own
+  system account, with its own folder that HomeTube itself cannot read. It fetches the account's own
+  lists: subscriptions, recommendations, Watch Later and YouTube history.
+- **Those lists go out by one fixed way**, the `account_via` setting:
+  - `home` (the default): the board's own internet connection, where you use the account on your phone
+    anyway, so Google sees it where it always does. With a VPN for HomeTube, the lists still skip it
+    (your provider sees connections to YouTube, as it does from your phone; never what you watch).
+  - `tunnel`: HomeTube's tunnel, pinned to one server. The first signed-in request pins the address
+    YouTube sees; before every later one, the account service asks YouTube which address it sees
+    (YouTube's own `redirector.googlevideo.com/report_mapping`, no third party). Any other address, or no
+    answer, pauses the account (the lists say so) until the tunnel is back on that server. With
+    HomeTube's own VPN the picker makes no moves for speed while an account is pinned, prefers its
+    server when it must move, and tries to go back to it once an hour.
+
+```sh
+sudo python3 /opt/hometube/hometube.py account via tunnel     # or: home
+```
+
+A VPN address can be flagged by itself, wherever it is. For `tunnel`, a separate Google account just for
+the TV is the safer choice.
 
 ## How it works
 
@@ -135,14 +162,16 @@ network cannot set or read them.
   requests a minute, changes are only accepted from the page's own origin, and the account cookies
   and the status can only be reached from the board itself.
 - The service runs as its own unprivileged account with a read-only system (`ProtectSystem=strict`),
-  no access to home folders, and a 768 MB memory cap.
+  no access to home folders, and a 768 MB memory cap. The account service is a second account of its
+  own, the only one that can read the cookies, reachable only through a socket for HomeTube's group.
 - Plain HTTP on your home network: keep the port off your router's port forwarding.
 
 ## With SBC Control Center
 
 [SBC Control Center](https://github.com/0xb0rn3/sbc-control-center) offers HomeTube during its install.
 It then runs HomeTube on `127.0.0.1:8891`, pinned to the board's VPN tunnel, and serves it at `/tv`
-on its own portal, which also connects the YouTube account for a signed-in administrator.
+on its own portal, which also connects the YouTube account for a signed-in administrator. Its server
+picker makes no moves for speed on HomeTube's tunnel while the account is set to `tunnel`.
 
 ## Tests
 

@@ -9,6 +9,8 @@ daily, because YouTube changes often. No Shorts anywhere.
   python3 hometube.py serve              # the service, started by systemd
   python3 hometube.py install-units      # root: account, optional VPN routing rule, service, daily yt-dlp update
   python3 hometube.py cookies FILE       # root: connect a YouTube account (cookies.txt); --clear to disconnect
+  python3 hometube.py account status     # the account: connected, its way out, paused or not
+  python3 hometube.py account via home|tunnel   # root: the way out of the account's own lists (default home)
   python3 hometube.py vpn import FILE    # root, optional: HomeTube's own WireGuard tunnel from any provider's
                                          #   .conf or .zip (the fastest server is picked and kept); vpn status, vpn off
 
@@ -49,7 +51,7 @@ DEFAULT_ROWS = [['Music', 'official music video'], ['Live now', 'live stream'], 
                 ['Tech', 'tech review'], ['News', 'world news today'], ['Comedy', 'stand up comedy'], ['Science', 'science documentary']]
 DEFAULTS: dict[str, Any] = {'bind': '127.0.0.1', 'port': 8891, 'app_dir': '/opt/hometube', 'state_dir': '/var/lib/hometube',
                             'user': 'hometube', 'route_table': None, 'route_pref': 91, 'route_dev': '', 'after_unit': '', 'label': '',
-                            'resolvers': [],
+                            'resolvers': [], 'account_via': 'home',
                             'rows': DEFAULT_ROWS}
 _UNIT_NAME = re.compile(r'[A-Za-z0-9@._-]{1,120}')
 _ACCOUNT = re.compile(r'[a-z_][a-z0-9_-]{0,31}')
@@ -91,6 +93,8 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
     res = cfg['resolvers']
     if not isinstance(res, list) or len(res) > 3 or not all(isinstance(r, str) and _is_ipv4(r) for r in res):
         raise ValueError('resolvers must be up to three IPv4 addresses')
+    if cfg['account_via'] not in ('home', 'tunnel'):
+        raise ValueError('account_via must be "home" or "tunnel"')
     if cfg['route_dev'] and not _IFACE.fullmatch(str(cfg['route_dev'])):
         raise ValueError('route_dev must be an interface name')
     if cfg['after_unit'] and not _UNIT_NAME.fullmatch(cfg['after_unit']):
@@ -121,7 +125,12 @@ _making: dict[str, threading.Event] = {}
 _slots = threading.BoundedSemaphore(3)   # at most three extractions at once on a small board
 _background = threading.BoundedSemaphore(2)   # home-page topic rows use two of them at most: one stays free for you
 _caption_urls: dict[str, dict[tuple[str, bool], str]] = {}
-COOKIES = STATE / 'cookies.txt'
+ACCOUNT_USER = f'{USER}-account'
+ACCOUNT_DIR = STATE.with_name(STATE.name + '-account')     # the account service's own, 0700: HomeTube cannot read it
+COOKIES = ACCOUNT_DIR / 'cookies.txt'
+ACCOUNT_STATE = ACCOUNT_DIR / 'account.json'
+ACCOUNT_SOCK = Path('/run') / f'{UNIT}-account' / 'account.sock'
+OLD_COOKIES = STATE / 'cookies.txt'                        # where they were before the account service
 ACCOUNT_FEEDS = {'subs': ':ytsubs', 'rec': ':ytrec', 'later': ':ytwatchlater', 'history': ':ythistory'}
 COOKIE_DOMAINS = ('.youtube.com', 'youtube.com', '.google.com', 'accounts.google.com', '.googleapis.com')
 LIST_LIMIT = 300
@@ -154,15 +163,19 @@ def _cached(key: str, ttl: float, make):
     return value
 
 
-def _ytdlp(args: list[str], timeout: float = 40, nice: int = 0) -> dict[str, Any]:
-    _require_route()
+def _ytdlp(args: list[str], timeout: float = 40, nice: int = 0, cookies: Path | None = None, route: bool = True,
+           home: Path | None = None) -> dict[str, Any]:
+    # cookies: only the account service passes them (see "The YouTube account" below). HomeTube's own
+    # lookups (videos, search, rows) never carry the account, wherever its VPN is.
+    if route:
+        _require_route()
     if not _slots.acquire(timeout=20):
         raise RuntimeError('busy: try again in a moment')
     try:
-        account = ['--cookies', str(COOKIES)] if COOKIES.exists() else []
+        account = ['--cookies', str(cookies)] if cookies is not None else []
         ipv4 = ['--force-ipv4'] if CONFIG['route_table'] is not None else []
         cp = subprocess.run([str(YTDLP), '--no-cache-dir', '--no-warnings', '--js-runtimes', f'deno:{DENO}', *ipv4, *account, '-J', *args],
-                            capture_output=True, text=True, timeout=timeout, env={'HOME': str(STATE), 'PATH': '/usr/bin:/bin'},
+                            capture_output=True, text=True, timeout=timeout, env={'HOME': str(home or STATE), 'PATH': '/usr/bin:/bin'},
                             preexec_fn=(lambda: os.nice(nice)) if nice else None)
     finally:
         _slots.release()
@@ -889,7 +902,79 @@ def import_takeout(csv_text: str) -> list[dict[str, str]]:
     return subscriptions()
 
 
-def set_cookies(text: str) -> dict[str, Any]:
+# ---- The YouTube account (optional). A Google account seen from a new country every time a VPN moves
+# can be flagged or locked, so:
+#   - Only the account service holds the cookies: its own system account (hometube-account), its own
+#     0700 folder. HomeTube's lookups for videos, search and rows never carry the account, so they can go
+#     out by any server the VPN picker chooses.
+#   - The account service fetches the account's own lists (subscriptions, recommendations, Watch Later,
+#     history) by one fixed way out, the account_via setting:
+#       "home"   (default) the board's own internet connection: where the household uses the account anyway
+#       "tunnel" HomeTube's tunnel, pinned to the address YouTube saw at the first signed-in request.
+#                Before every signed-in request the account service asks YouTube which address it sees
+#                (redirector.googlevideo.com/report_mapping, YouTube's own); another address pauses the
+#                account until the tunnel is back on that server. With HomeTube's own VPN the picker keeps
+#                the tunnel there and returns to it.
+#   Without any VPN for HomeTube both are the same: the board's connection.
+REPORT_MAPPING = 'https://redirector.googlevideo.com/report_mapping'
+
+
+def account_via() -> str:
+    """The way the account's requests actually leave: "tunnel" only when HomeTube has one."""
+    return 'tunnel' if CONFIG['account_via'] == 'tunnel' and CONFIG['route_table'] is not None else 'home'
+
+
+def youtube_sees(timeout: float = 8) -> str | None:
+    """The address YouTube sees for this account's traffic, as YouTube's own servers report it."""
+    try:
+        with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(REPORT_MAPPING, timeout=timeout) as r:
+            first = r.read(4096).decode('ascii', 'replace').split()
+        ipaddress.ip_address(first[0])
+        return first[0] if len(first) > 1 and first[1] == '=>' else None
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _account_state() -> dict[str, Any]:
+    try:
+        data = json.loads(ACCOUNT_STATE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_account_state(data: dict[str, Any]) -> None:
+    old = os.umask(0o077)
+    try:
+        ACCOUNT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _durable_write(ACCOUNT_STATE, json.dumps(data))
+    finally:
+        os.umask(old)
+
+
+def account_check() -> tuple[bool, str]:
+    """May a signed-in request go out now? (account service side; it records what it measured)"""
+    st = _account_state()
+    via = account_via()
+    saw = youtube_sees()
+    st.update(via=via, saw=saw, saw_at=int(time.time()))
+    why = ''
+    if via == 'tunnel':
+        ok, route_why = route_status(force=True)
+        if not ok:
+            why = f'the tunnel is not the way out ({route_why})'
+        elif saw is None:
+            why = 'YouTube could not be asked which address it sees'
+        elif not st.get('pin'):
+            st['pin'] = saw   # the first signed-in request: from now on only this address
+        elif saw != st['pin']:
+            why = 'the VPN is on another server than the one this account uses'
+    st['paused'] = why or None
+    _save_account_state(st)
+    return not why, why
+
+
+def account_set(text: str) -> dict[str, Any]:
     """A Netscape cookies.txt exported from a private window: only YouTube and Google cookies are kept."""
     kept = []
     for line in str(text).splitlines()[:5000]:
@@ -898,34 +983,116 @@ def set_cookies(text: str) -> dict[str, Any]:
             kept.append(line)
     if not any('youtube.com' in l for l in kept) or not any(l.split('\t')[5] in ('SAPISID', '__Secure-3PAPISID', 'LOGIN_INFO') for l in kept):
         raise ValueError('These are not signed-in YouTube cookies (export them from youtube.com while signed in).')
-    STATE.mkdir(parents=True, exist_ok=True)
-    _durable_write(COOKIES, '# Netscape HTTP Cookie File\n' + '\n'.join(kept) + '\n')
+    old = os.umask(0o077)   # never readable by anyone else, not even for a moment
+    try:
+        ACCOUNT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _durable_write(COOKIES, '# Netscape HTTP Cookie File\n' + '\n'.join(kept) + '\n')
+    finally:
+        os.umask(old)
     os.chmod(COOKIES, 0o600)
-    _cache.clear()
-    return {'connected': True, 'cookies': len(kept)}
+    _save_account_state({'via': account_via(), 'connected_at': int(time.time())})   # a new account: a new pin
+    return {'connected': True, 'cookies': len(kept), 'via': account_via()}
 
 
-def clear_cookies() -> dict[str, Any]:
+def account_clear() -> dict[str, Any]:
     COOKIES.unlink(missing_ok=True)
-    _cache.clear()
+    ACCOUNT_STATE.unlink(missing_ok=True)
     return {'connected': False}
+
+
+def account_status() -> dict[str, Any]:
+    st = _account_state()
+    return {'connected': COOKIES.exists(), 'via': account_via(), 'pin': st.get('pin'), 'saw': st.get('saw'),
+            'saw_at': st.get('saw_at'), 'paused': st.get('paused') if COOKIES.exists() else None}
+
+
+def account_fetch(name: str, count: int = 40) -> list[dict[str, Any]]:
+    """One of the account's lists, fetched signed in (account service side)."""
+    if name not in ACCOUNT_FEEDS:
+        raise ValueError('unknown feed')
+    if not COOKIES.exists():
+        raise ValueError('No YouTube account is connected.')
+    ok, why = account_check()
+    if not ok:
+        raise RuntimeError(f'Your YouTube account is paused: {why}. It resumes by itself.')
+    data = _ytdlp([ACCOUNT_FEEDS[name], '--flat-playlist', '-I', f'1:{max(1, min(int(count), 100))}'], timeout=90,
+                  cookies=COOKIES, route=account_via() == 'tunnel', home=ACCOUNT_DIR)
+    out = []
+    for e in data.get('entries') or []:
+        vid = e.get('id') or ''
+        if VIDEO_ID.fullmatch(vid) and not _is_short(e.get('url')):
+            out.append({'id': vid, 'title': str(e.get('title') or '')[:200], 'channel': str(e.get('channel') or e.get('uploader') or '')[:80],
+                        'channel_id': e.get('channel_id') if CHANNEL_ID.fullmatch(str(e.get('channel_id') or '')) else None,
+                        'duration': e.get('duration'), 'thumb': _thumb(vid)})
+    return out
+
+
+def account_answer(req: dict[str, Any]) -> dict[str, Any]:
+    """The account service's answer to one request from HomeTube."""
+    op = req.get('op')
+    try:
+        if op == 'status':
+            return {'ok': True, **account_status()}
+        if op == 'feed':
+            return {'ok': True, 'items': account_fetch(str(req.get('name', '')), int(req.get('count') or 40))}
+        if op == 'set':
+            return {'ok': True, **account_set(str(req.get('text', ''))[:400_000])}
+        if op == 'clear':
+            return {'ok': True, **account_clear()}
+        return {'ok': False, 'error': 'unknown request'}
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)[:300]}
+
+
+def account_serve(sock_path: Path = ACCOUNT_SOCK) -> None:
+    """The account service: one JSON request per connection on a Unix socket only HomeTube's group can open."""
+    import socketserver
+
+    class Account(socketserver.StreamRequestHandler):
+        def handle(self):
+            try:
+                req = json.loads(self.rfile.readline(600_000) or b'{}')
+            except ValueError:
+                req = {}
+            self.wfile.write(json.dumps(account_answer(req if isinstance(req, dict) else {})).encode() + b'\n')
+
+    class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
+        daemon_threads = True
+
+    ACCOUNT_DIR.mkdir(parents=True, exist_ok=True)
+    sock_path.unlink(missing_ok=True)
+    with Server(str(sock_path), Account) as server:
+        os.chmod(sock_path, 0o660)
+        server.serve_forever()
+
+
+def account_call(req: dict[str, Any], timeout: float = 100, sock_path: Path | None = None) -> dict[str, Any]:
+    """HomeTube asking the account service (HomeTube side)."""
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(timeout)
+            s.connect(str(sock_path or ACCOUNT_SOCK))
+            s.sendall(json.dumps(req).encode() + b'\n')
+            buf = b''
+            while not buf.endswith(b'\n'):
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+        return json.loads(buf or b'{}')
+    except (OSError, ValueError):
+        return {'ok': False, 'connected': False, 'error': 'The YouTube account service is not running.'}
 
 
 def account_feed(name: str, count: int = 40) -> list[dict[str, Any]]:
     if name not in ACCOUNT_FEEDS:
         raise ValueError('unknown feed')
-    if not COOKIES.exists():
-        raise ValueError('No YouTube account is connected.')
     def make():
-        data = _ytdlp([ACCOUNT_FEEDS[name], '--flat-playlist', '-I', f'1:{count}'], timeout=90)
-        out = []
-        for e in data.get('entries') or []:
-            vid = e.get('id') or ''
-            if VIDEO_ID.fullmatch(vid) and not _is_short(e.get('url')):
-                out.append({'id': vid, 'title': str(e.get('title') or '')[:200], 'channel': str(e.get('channel') or e.get('uploader') or '')[:80],
-                            'channel_id': e.get('channel_id') if CHANNEL_ID.fullmatch(str(e.get('channel_id') or '')) else None,
-                            'duration': e.get('duration'), 'thumb': _thumb(vid)})
-        return out
+        d = account_call({'op': 'feed', 'name': name, 'count': count})
+        if not d.get('ok'):
+            raise RuntimeError(d.get('error') or 'The account list did not load.')
+        return d.get('items') or []
     return _cached(f'a:{name}', 900, make)
 
 
@@ -1134,7 +1301,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(200, {'ok': True, 'route_dev': CONFIG['route_dev'] or None, 'route_ok': ok, 'route_problem': why or None,
                                  'youtube_saw': _exit_seen['ip'], 'youtube_saw_at': _exit_seen['at'] or None,
                                  'lookup_ok_at': _youtube['ok_at'] or None, 'youtube_refused_at': _youtube['refused_at'] or None,
-                                 'page_browsers': _page_agents})
+                                 'page_browsers': _page_agents, 'account': {k: v for k, v in account_call({'op': 'status'}, timeout=3).items() if k != 'ok'}})
             elif name == 'probe':
                 if not self.local():
                     self.reply(403, {'ok': False, 'error': 'the probe runs on the board only'})
@@ -1163,7 +1330,8 @@ class Handler(BaseHTTPRequestHandler):
             elif name in ('history', 'later'):
                 self.reply(200, {'ok': True, 'items': get_list(name)})
             elif name == 'account':
-                self.reply(200, {'ok': True, 'connected': COOKIES.exists()})
+                d = account_call({'op': 'status'}, timeout=3)   # no addresses here: the page is on the network
+                self.reply(200, {'ok': True, 'connected': bool(d.get('connected')), 'via': d.get('via'), 'paused': d.get('paused')})
             elif name == 'feed':
                 self.reply(200, {'ok': True, 'items': account_feed(q.get('name', ''))})
             elif name == 'captions':
@@ -1203,7 +1371,11 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.local():
                     self.reply(403, {'ok': False, 'error': 'Connect the account on the board: sudo hometube cookies FILE'})
                     return
-                self.reply(200, {'ok': True, **(clear_cookies() if data.get('clear') else set_cookies(str(data.get('text', ''))[:400_000]))})
+                d = account_call({'op': 'clear'} if data.get('clear') else {'op': 'set', 'text': str(data.get('text', ''))[:400_000]}, timeout=20)
+                _cache.clear()
+                if not d.get('ok'):
+                    raise ValueError(d.get('error') or 'The account service did not answer.')
+                self.reply(200, d)
             else:
                 self.reply(404, {'ok': False, 'error': 'not found'})
         except Exception as exc:
@@ -1250,8 +1422,8 @@ def _write_unit(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def unit_files(uid: int) -> dict[str, str]:
-    """The service, its daily yt-dlp update and the timer, from the settings."""
+def unit_files(uid: int, account_uid: int | None = None) -> dict[str, str]:
+    """The service, its daily yt-dlp update and the timer, and the account service, from the settings."""
     table, after = CONFIG['route_table'], CONFIG['after_unit']
     pin = ''
     if table is not None:
@@ -1316,7 +1488,58 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 """
-    return {f'{UNIT}.service': service, f'{UNIT}-update.service': update, f'{UNIT}-update.timer': timer}
+    return {f'{UNIT}.service': service, f'{UNIT}-update.service': update, f'{UNIT}-update.timer': timer,
+            f'{UNIT}-account.service': account_unit(account_uid if account_uid is not None else uid)}
+
+
+def account_unit(auid: int) -> str:
+    """The account service: the only holder of the cookies. Its way out is account_via: the board's own
+    connection (no rule: the board's routing), or HomeTube's table, pinned and checked like HomeTube."""
+    table = CONFIG['route_table']
+    tunnel = account_via() == 'tunnel'
+    pin, extra, families = '', '', 'AF_UNIX AF_INET AF_INET6'
+    if tunnel:
+        pref = CONFIG['route_pref']
+        pin = (f'ExecStartPre=+/bin/sh -c \'ip -4 rule show | grep -q "uidrange {auid}-{auid} lookup {table}" || '
+               f'ip -4 rule add pref {pref} uidrange {auid}-{auid} lookup {table}\'\n')
+        families = 'AF_UNIX AF_INET' + (' AF_NETLINK' if CONFIG['route_dev'] else '')
+        if CONFIG['resolvers']:
+            extra = f'BindReadOnlyPaths={VPN_RESOLV}:/etc/resolv.conf {VPN_NSSWITCH}:/etc/nsswitch.conf\n'
+    after = (' ' + CONFIG['after_unit']) if tunnel and CONFIG['after_unit'] else ''
+    state = ('StateDirectory=hometube-account\nStateDirectoryMode=0700\n' if ACCOUNT_DIR == Path('/var/lib/hometube-account')
+             else f'ReadWritePaths={ACCOUNT_DIR}\n')
+    return f"""[Unit]
+Description=HomeTube: the YouTube account (the only holder of its cookies)
+After=network-online.target{after}
+Wants=network-online.target
+
+[Service]
+User={ACCOUNT_USER}
+Group={USER}
+{pin}Environment=HOMETUBE_CONFIG={CONFIG_PATH}
+ExecStart={APP_DIR}/venv/bin/python -I {APP_DIR}/hometube.py account-serve
+{state}RuntimeDirectory={ACCOUNT_SOCK.parent.name}
+RuntimeDirectoryMode=0750
+{extra}UMask=0077
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies={families}
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=384M
+Nice=8
+
+[Install]
+WantedBy=multi-user.target
+"""
 
 
 def install_units() -> None:
@@ -1325,6 +1548,18 @@ def install_units() -> None:
     if subprocess.run(['getent', 'passwd', USER], capture_output=True).returncode != 0:
         subprocess.run(['useradd', '--system', '--home-dir', '/nonexistent', '--shell', '/usr/sbin/nologin', USER], check=True)
     uid = int(subprocess.run(['id', '-u', USER], capture_output=True, text=True, check=True).stdout)
+    if subprocess.run(['getent', 'passwd', ACCOUNT_USER], capture_output=True).returncode != 0:
+        subprocess.run(['useradd', '--system', '--no-user-group', '--gid', USER, '--home-dir', '/nonexistent',
+                        '--shell', '/usr/sbin/nologin', ACCOUNT_USER], check=True)
+    auid = _account_ids()[0]
+    if OLD_COOKIES.exists():   # from before the account service: HomeTube itself no longer holds them
+        ACCOUNT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if not COOKIES.exists():
+            os.replace(OLD_COOKIES, COOKIES)
+        OLD_COOKIES.unlink(missing_ok=True)
+        print('The YouTube account moved to the account service. ' + _via_sentence())
+    if ACCOUNT_DIR.exists():
+        _own_account_files()
     if STATE != Path('/var/lib/hometube'):
         STATE.mkdir(parents=True, exist_ok=True)
         os.chown(STATE, uid, int(subprocess.run(['id', '-g', USER], capture_output=True, text=True, check=True).stdout))
@@ -1332,7 +1567,7 @@ def install_units() -> None:
         _write_unit(VPN_RESOLV, ''.join(f'nameserver {r}\n' for r in CONFIG['resolvers']) + 'options timeout:2 attempts:2\n')
         _write_unit(VPN_NSSWITCH, _nsswitch_files_dns())
     own_vpn = CONFIG['route_dev'] == VPN_IFACE
-    units = unit_files(uid)
+    units = unit_files(uid, auid)
     if own_vpn:
         units.update(vpn_check_units())
     for name, text in units.items():
@@ -1344,12 +1579,13 @@ def install_units() -> None:
     os.sync()
     # a rule left from an earlier table would keep this account's traffic going that way: clear them
     # all; the service puts back the one it should have when it starts
-    for _ in range(20):
-        if subprocess.run(['ip', '-4', 'rule', 'del', 'uidrange', f'{uid}-{uid}'], capture_output=True).returncode != 0:
-            break
+    for account in (uid, auid):
+        for _ in range(20):
+            if subprocess.run(['ip', '-4', 'rule', 'del', 'uidrange', f'{account}-{account}'], capture_output=True).returncode != 0:
+                break
     subprocess.run(['systemctl', 'daemon-reload'], check=True)
-    subprocess.run(['systemctl', 'enable', f'{UNIT}.service', f'{UNIT}-update.timer'], check=True)
-    subprocess.run(['systemctl', 'restart', f'{UNIT}.service'], check=True)
+    subprocess.run(['systemctl', 'enable', f'{UNIT}.service', f'{UNIT}-update.timer', f'{UNIT}-account.service'], check=True)
+    subprocess.run(['systemctl', 'restart', f'{UNIT}-account.service', f'{UNIT}.service'], check=True)
     subprocess.run(['systemctl', 'start', f'{UNIT}-update.timer'], check=True)
     if own_vpn:
         subprocess.run(['systemctl', 'enable', '--now', f'{UNIT}-vpn.timer'], check=True)
@@ -1357,23 +1593,83 @@ def install_units() -> None:
     print(f'HomeTube running: {where}' + (f" (its traffic only through table {CONFIG['route_table']})" if CONFIG['route_table'] is not None else ''))
 
 
+def _account_ids() -> tuple[int, int]:
+    uid = int(subprocess.run(['id', '-u', ACCOUNT_USER], capture_output=True, text=True, check=True).stdout)
+    gid = int(subprocess.run(['id', '-g', ACCOUNT_USER], capture_output=True, text=True, check=True).stdout)
+    return uid, gid
+
+
+def _own_account_files() -> None:
+    uid, gid = _account_ids()
+    ACCOUNT_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ACCOUNT_DIR, 0o700)
+    for path in (ACCOUNT_DIR, COOKIES, ACCOUNT_STATE):
+        if path.exists():
+            os.chown(path, uid, gid)
+
+
 def cookies_command(args: list[str]) -> None:
     """Connect a YouTube account from a cookies.txt exported while signed in, or --clear it."""
     if os.geteuid() != 0:
         raise SystemExit('run as root')
+    try:
+        _account_ids()
+    except (subprocess.CalledProcessError, ValueError):
+        raise SystemExit('the account service is not installed yet: run the installer (or install-units) first')
     if args[:1] == ['--clear']:
-        clear_cookies()
+        account_clear()
+        subprocess.run(['systemctl', 'try-restart', f'{UNIT}.service'], check=False)   # forgets the cached lists
         print('YouTube account disconnected.')
         return
     if len(args) != 1:
         raise SystemExit('usage: hometube.py cookies FILE | --clear')
-    result = set_cookies(Path(args[0]).read_text(errors='replace'))
-    uid = int(subprocess.run(['id', '-u', USER], capture_output=True, text=True, check=True).stdout)
-    gid = int(subprocess.run(['id', '-g', USER], capture_output=True, text=True, check=True).stdout)
-    os.chown(COOKIES, uid, gid)
+    result = account_set(Path(args[0]).read_text(errors='replace'))
+    _own_account_files()
     subprocess.run(['systemctl', 'try-restart', f'{UNIT}.service'], check=False)
-    print(f"YouTube account connected ({result['cookies']} cookies kept).")
+    print(f"YouTube account connected ({result['cookies']} cookies kept). Videos never use it.")
+    print(_via_sentence())
 
+
+def _via_sentence() -> str:
+    if account_via() == 'tunnel':
+        return ("The account's own lists go out through HomeTube's tunnel, only from the one server address YouTube "
+                'sees at the first of them (the account pauses when the tunnel is elsewhere).')
+    if CONFIG['route_table'] is not None:
+        return ("The account's own lists go out through this board's own internet connection, where you normally use "
+                "the account, not the VPN: a Google account seen from a new country can be flagged. "
+                '`hometube.py account via tunnel` keeps them in the tunnel, pinned to one server.')
+    return "The account's own lists go out through this board's internet connection, like everything of HomeTube."
+
+
+def account_command(args: list[str]) -> None:
+    """account status | account via home|tunnel"""
+    if args[:1] == ['status'] and len(args) == 1:
+        st = account_call({'op': 'status'}, timeout=5)
+        if 'via' not in st:
+            raise SystemExit(st.get('error') or 'the account service did not answer')
+        print(f"YouTube account: {'connected' if st.get('connected') else 'not connected'} · way out: {st['via']}"
+              + (f" · pinned to {st['pin']}" if st.get('pin') else '') + (f" · paused: {st['paused']}" if st.get('paused') else ''))
+        if st.get('saw'):
+            print(f"  YouTube last saw the account's requests from {st['saw']}")
+        print('  ' + _via_sentence())
+        return
+    if args[:1] == ['via'] and len(args) == 2 and args[1] in ('home', 'tunnel'):
+        if os.geteuid() != 0:
+            raise SystemExit('run as root')
+        try:
+            data = json.loads(CONFIG_PATH.read_text())
+        except (OSError, ValueError):
+            data = {}
+        data['account_via'] = args[1]
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _write_unit(CONFIG_PATH, json.dumps(data, indent=2) + '\n')
+        CONFIG.clear(); CONFIG.update(load_config(CONFIG_PATH))
+        if ACCOUNT_STATE.exists():   # a new way out: a new pin
+            st = _account_state(); st.pop('pin', None); st.pop('paused', None); _save_account_state(st); _own_account_files()
+        install_units()
+        print(_via_sentence())
+        return
+    raise SystemExit('usage: hometube.py account status | account via home|tunnel')
 
 
 # ---- HomeTube's own VPN (optional). HomeTube needs no VPN. Someone who wants one for HomeTube imports
@@ -1395,6 +1691,7 @@ VPN_MIN_GAIN = 20.0        # ...and 20 ms faster
 VPN_REMEASURE = 6 * 3600
 VPN_AVOID = 3600           # a server that did not answer is left alone an hour
 VPN_YOUTUBE_AVOID = 24 * 3600
+VPN_RETURN = 3600          # away from the YouTube account's server: try going back once an hour
 _WG_KEY = re.compile(r'[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=')
 _HOSTPORT = re.compile(r'\[?([0-9a-fA-F:.]+|[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?)\]?:([0-9]{1,5})')
 
@@ -1570,12 +1867,16 @@ def _set_vpn_settings(on: bool, dns: list[str] | None = None) -> None:
     install_units()
 
 
-def vpn_move(servers: list[dict[str, Any]], current: str | None, why: str, must_move: bool) -> dict[str, Any] | None:
-    """Put the tunnel on the fastest server that works (another one when must_move). None if none did."""
+def vpn_move(servers: list[dict[str, Any]], current: str | None, why: str, must_move: bool,
+             prefer: str | None = None) -> dict[str, Any] | None:
+    """Put the tunnel on the fastest server that works (another one when must_move). None if none did.
+    prefer: tried first when it answers (the YouTube account's server)."""
     state = _read_vpn(VPN_STATE, {})
     now = time.time()
     skip = {h for h, t in (state.get('avoid') or {}).items() if t > now} | {h for h, t in (state.get('youtube_avoid') or {}).items() if t > now}
     ranked = vpn_ranked(servers, skip)
+    if prefer:
+        ranked.sort(key=lambda x: x[1]['name'] != prefer)   # stable: the rest stay fastest first
     times = {s['name']: t for t, s in ranked}
     state['latency'] = times
     state['measured_at'] = int(now)
@@ -1638,6 +1939,42 @@ def vpn_off() -> None:
     print('HomeTube goes out directly again (its imported servers are kept: `vpn import` the file again to use them).')
 
 
+def _account_server(state: dict[str, Any], current: str | None) -> str | None:
+    """With the YouTube account in the tunnel (account_via "tunnel"): the server it is pinned to. Found
+    once the account service has seen the pinned address with the tunnel on one server since."""
+    if account_via() != 'tunnel' or not COOKIES.exists():
+        return None
+    acct = _account_state()
+    pin = acct.get('pin')
+    if not pin:
+        return None
+    if state.get('account_pin') == pin and state.get('account_server'):
+        return state['account_server']
+    if current and acct.get('saw') == pin and (acct.get('saw_at') or 0) >= (state.get('switched_at') or 0):
+        state.update(account_pin=pin, account_server=current)
+        _write_vpn(VPN_STATE, state)
+        return current
+    return None
+
+
+def vpn_return(servers: list[dict[str, Any]], current: str | None, target: str) -> dict[str, Any] | None:
+    """Back to the account's server if it answers; otherwise back where it was."""
+    by = {s['name']: s for s in servers}
+    if target not in by:
+        return None
+    if _vpn_up(by[target]):
+        state = _read_vpn(VPN_STATE, {})
+        state.update(current=target, switched_at=int(time.time()), fails=0)
+        _write_vpn(VPN_STATE, state)
+        return {'server': target, 'latency_ms': round((state.get('latency') or {}).get(target) or 0), 'dns': by[target].get('dns') or []}
+    state = _read_vpn(VPN_STATE, {})
+    state.setdefault('avoid', {})[target] = int(time.time() + VPN_AVOID)
+    _write_vpn(VPN_STATE, state)
+    if current in by:
+        _vpn_up(by[current])
+    return None
+
+
 def vpn_check() -> str | None:
     """The minute check (root, from hometube-vpn.timer): keep the tunnel on the fastest server that works."""
     if CONFIG['route_dev'] != VPN_IFACE or not VPN_CONF.exists():
@@ -1661,9 +1998,25 @@ def vpn_check() -> str | None:
     if dead and current:
         state.setdefault('avoid', {})[current] = int(time.time() + VPN_AVOID)
         _write_vpn(VPN_STATE, state)
+    home = _account_server(state, current)
+    now = time.time()
+    if home and not (dead or refused):
+        # the account's server: no moves for speed; away from it (it failed earlier), try it once an hour
+        active = {**(state.get('avoid') or {}), **(state.get('youtube_avoid') or {})}
+        if current == home or now - (state.get('return_tried_at') or 0) < VPN_RETURN or active.get(home, 0) > now:
+            return None
+        state['return_tried_at'] = int(now)
+        _write_vpn(VPN_STATE, state)
+        moved = vpn_return(servers, current, home)
+        if moved and moved['dns'] != CONFIG['resolvers'] and (moved['dns'] or CONFIG['resolvers'] != list(VPN_PUBLIC_PROBES)):
+            _set_vpn_settings(True, moved['dns'])
+        msg = f"back on the YouTube account's server {home}" if moved else f"the account's server {home} does not answer yet"
+        print(f'[hometube vpn] {msg}', flush=True)
+        return msg
     if not (dead or refused or due):
         return None
-    moved = vpn_move(servers, current, 'youtube' if refused else 'dead' if dead else 'faster', must_move=dead or refused)
+    moved = vpn_move(servers, current, 'youtube' if refused else 'dead' if dead else 'faster', must_move=dead or refused,
+                     prefer=home if home != current else None)
     if moved and moved['dns'] != CONFIG['resolvers'] and (moved['dns'] or CONFIG['resolvers'] != list(VPN_PUBLIC_PROBES)):
         _set_vpn_settings(True, moved['dns'])
     msg = (f"moved to {moved['server']} ({moved['latency_ms']} ms)" if moved
@@ -1736,6 +2089,10 @@ if __name__ == '__main__':
         install_units()
     elif command == 'cookies':
         cookies_command(rest)
+    elif command == 'account':
+        account_command(rest)
+    elif command == 'account-serve':
+        account_serve()
     elif command == 'vpn' and rest[:1] == ['import'] and len(rest) == 2:
         vpn_import(rest[1])
     elif command == 'vpn' and rest == ['off']:

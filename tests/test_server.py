@@ -25,9 +25,18 @@ def opener():
 class ServerCase(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        self.patches = [mock.patch.object(ht, 'STATE', self.tmp), mock.patch.object(ht, 'COOKIES', self.tmp / 'cookies.txt')]
+        acct = self.tmp / 'acct'
+        self.patches = [mock.patch.object(ht, 'STATE', self.tmp), mock.patch.object(ht, 'ACCOUNT_DIR', acct),
+                        mock.patch.object(ht, 'COOKIES', acct / 'cookies.txt'), mock.patch.object(ht, 'ACCOUNT_STATE', acct / 'account.json'),
+                        mock.patch.object(ht, 'ACCOUNT_SOCK', self.tmp / 'account.sock')]
         for p in self.patches:
             p.start()
+        # the account service, as on a board: its own socket (the cookies live behind it)
+        threading.Thread(target=ht.account_serve, args=(self.tmp / 'account.sock',), daemon=True).start()
+        for _ in range(100):
+            if (self.tmp / 'account.sock').exists():
+                break
+            __import__('time').sleep(0.02)
         ht._cache.clear()
         ht._hits.clear()
         self.server = ht.Server(('127.0.0.1', 0), ht.Handler)
@@ -123,10 +132,16 @@ class WhoMayChangeWhatTests(ServerCase):
         good = '\n'.join(['# Netscape HTTP Cookie File', '.youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc'])
         with mock.patch.object(ht.Handler, 'local', return_value=False):
             self.assertEqual(self.status_of(lambda: self.post('/api/tv/cookies', {'text': good})), 403)
-        self.assertFalse((self.tmp / 'cookies.txt').exists())
+        self.assertFalse((self.tmp / 'acct' / 'cookies.txt').exists())
         self.assertEqual(self.post('/api/tv/cookies', {'text': good}).status, 200)   # the portal on this board, after its sign-in
-        self.assertTrue((self.tmp / 'cookies.txt').exists())
-        self.assertEqual((self.tmp / 'cookies.txt').stat().st_mode & 0o777, 0o600)
+        self.assertTrue((self.tmp / 'acct' / 'cookies.txt').exists())             # kept by the account service, not HomeTube
+        self.assertFalse((self.tmp / 'cookies.txt').exists())
+        self.assertEqual((self.tmp / 'acct' / 'cookies.txt').stat().st_mode & 0o777, 0o600)
+        page = json.loads(self.get('/api/tv/account').read())
+        self.assertEqual((page['connected'], page['via']), (True, 'home'))
+        self.assertNotIn('saw', page)                                                 # no addresses for the network
+        self.assertEqual(self.post('/api/tv/cookies', {'clear': True}).status, 200)
+        self.assertFalse(json.loads(self.get('/api/tv/account').read())['connected'])
 
     def test_status_only_from_this_board(self):
         with mock.patch.object(ht.Handler, 'local', return_value=False):

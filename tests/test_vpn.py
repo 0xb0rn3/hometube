@@ -157,6 +157,38 @@ class PickerTests(unittest.TestCase):
             self.assertIn('moved to b', ht.vpn_check())
         settings.assert_not_called()                        # same resolvers: HomeTube is not restarted
 
+    def test_the_youtube_accounts_server_keeps_the_tunnel(self):
+        # account_via "tunnel": the tunnel stays on the account's server, and goes back to it
+        ht.VPN_CONF.write_text('x')
+        (self.tmp / 'cookies.txt').write_text('# a connected account')
+        ht._write_vpn(ht.VPN_SERVERS, self.servers)
+        self.latency = {'a': 50.0, 'b': 60.0, 'c': 200.0}
+        acct = {'pin': '203.0.113.10', 'saw': '203.0.113.10', 'saw_at': int(time.time())}
+        ht._write_vpn(ht.VPN_STATE, {'current': 'c', 'measured_at': 0, 'switched_at': int(time.time()) - 60})
+        cfg = {'route_dev': ht.VPN_IFACE, 'route_table': ht.VPN_TABLE, 'account_via': 'tunnel', 'resolvers': ['10.2.0.1']}
+        with mock.patch.dict(ht.CONFIG, cfg), mock.patch.object(ht, '_account_state', side_effect=lambda: dict(acct)), \
+             mock.patch.object(ht, 'COOKIES', self.tmp / 'cookies.txt'), \
+             mock.patch.object(ht, 'vpn_answers', return_value=True), \
+             mock.patch.object(ht.urllib.request, 'urlopen', side_effect=OSError('not running')), \
+             mock.patch.object(ht, '_set_vpn_settings'):
+            self.assertIsNone(ht.vpn_check())                           # c is 4x slower and due: no move for speed
+            self.assertEqual(ht._read_vpn(ht.VPN_STATE, {})['account_server'], 'c')
+            self.assertEqual(self.up, [])
+            st = ht._read_vpn(ht.VPN_STATE, {}); st['current'] = 'a'; ht._write_vpn(ht.VPN_STATE, st)   # it had to move away
+            self.dead = {'c'}
+            self.assertIn('does not answer', ht.vpn_check())            # tries its server; c does not answer: back to a
+            self.assertEqual((self.up, ht._read_vpn(ht.VPN_STATE, {})['current']), (['c', 'a'], 'a'))
+            self.assertIsNone(ht.vpn_check())                           # not again within the hour
+            st = ht._read_vpn(ht.VPN_STATE, {}); st['return_tried_at'] = 0; st['avoid'] = {}; ht._write_vpn(ht.VPN_STATE, st)
+            self.dead = set()
+            self.assertIn('back on', ht.vpn_check())
+            self.assertEqual(ht._read_vpn(ht.VPN_STATE, {})['current'], 'c')
+
+    def test_a_forced_move_prefers_the_accounts_server(self):
+        self.latency = {'a': 50.0, 'b': 60.0, 'c': 200.0}
+        moved = ht.vpn_move(self.servers, 'b', 'dead', must_move=True, prefer='c')
+        self.assertEqual(moved['server'], 'c')
+
     def test_off_means_nothing_runs(self):
         with mock.patch.dict(ht.CONFIG, {'route_dev': ''}), mock.patch.object(ht, 'vpn_answers', side_effect=AssertionError('no probing when off')):
             self.assertIsNone(ht.vpn_check())

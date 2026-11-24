@@ -64,21 +64,22 @@ class LibraryTests(unittest.TestCase):
 
 
     def test_cookies_keep_only_youtube_and_google(self):
-        with mock.patch.object(ht, 'COOKIES', self.tmp / 'cookies.txt'):
+        with mock.patch.object(ht, 'ACCOUNT_DIR', self.tmp), mock.patch.object(ht, 'COOKIES', self.tmp / 'cookies.txt'), \
+             mock.patch.object(ht, 'ACCOUNT_STATE', self.tmp / 'account.json'):
             text = "\n".join([
                 "# Netscape HTTP Cookie File",
                 ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSAPISID\tabc",
                 "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\txyz",
                 ".bank.example\tTRUE\t/\tTRUE\t1999999999\tsession\tsecret",
             ])
-            result = ht.set_cookies(text)
+            result = ht.account_set(text)
             saved = (self.tmp / 'cookies.txt').read_text()
             self.assertEqual(result['cookies'], 2)
             self.assertNotIn('bank.example', saved)
             self.assertEqual((self.tmp / 'cookies.txt').stat().st_mode & 0o777, 0o600)
             with self.assertRaises(ValueError):
-                ht.set_cookies(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tPREF\tf6=40000000")
-            ht.clear_cookies()
+                ht.account_set(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tPREF\tf6=40000000")
+            ht.account_clear()
             self.assertFalse((self.tmp / 'cookies.txt').exists())
 
     def test_timedtext_becomes_webvtt(self):
