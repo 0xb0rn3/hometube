@@ -153,8 +153,31 @@ def _ytdlp(args: list[str], timeout: float = 40, nice: int = 0) -> dict[str, Any
     finally:
         _slots.release()
     if cp.returncode != 0:
-        raise RuntimeError((cp.stderr.strip().splitlines() or ['extraction failed'])[-1][:300])
+        why = (cp.stderr.strip().splitlines() or ['extraction failed'])[-1][:300]
+        if YOUTUBE_REFUSED.search(why):   # YouTube asks this address to sign in: worth moving the tunnel
+            _youtube['refused_at'] = int(time.time())
+        raise RuntimeError(why)
+    _youtube['ok_at'] = int(time.time())
     return json.loads(cp.stdout)
+
+
+YOUTUBE_REFUSED = re.compile(r'confirm you.re not a bot|Sign in to confirm', re.I)
+_youtube = {'ok_at': 0, 'refused_at': 0}
+PROBE_VIDEO = 'jNQXAC9IVRw'   # a short, old, public video that is always there
+
+
+def probe() -> dict[str, Any]:
+    """A fresh lookup (never from the cache): can YouTube be reached through the way out right now?
+    For the board (a VPN server picker asks this after moving HomeTube's tunnel)."""
+    try:
+        d = _ytdlp([f'https://www.youtube.com/watch?v={PROBE_VIDEO}'], timeout=90)
+    except Exception as exc:
+        return {'ok': True, 'lookup': 'refused' if YOUTUBE_REFUSED.search(str(exc)) else 'failed', 'error': str(exc)[:200]}
+    for f in d.get('formats') or []:
+        if f.get('manifest_url') or f.get('url'):
+            _note_exit(f.get('manifest_url') or f.get('url'))
+            break
+    return {'ok': True, 'lookup': 'ok', 'youtube_saw': _exit_seen['ip']}
 
 
 _route = {'at': 0.0, 'ok': True, 'why': ''}
@@ -1088,7 +1111,13 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 ok, why = route_status(force=True)
                 self.reply(200, {'ok': True, 'route_dev': CONFIG['route_dev'] or None, 'route_ok': ok, 'route_problem': why or None,
-                                 'youtube_saw': _exit_seen['ip'], 'youtube_saw_at': _exit_seen['at'] or None})
+                                 'youtube_saw': _exit_seen['ip'], 'youtube_saw_at': _exit_seen['at'] or None,
+                                 'lookup_ok_at': _youtube['ok_at'] or None, 'youtube_refused_at': _youtube['refused_at'] or None})
+            elif name == 'probe':
+                if not self.local():
+                    self.reply(403, {'ok': False, 'error': 'the probe runs on the board only'})
+                    return
+                self.reply(200, probe())
             elif name == 'config':
                 self.reply(200, {'ok': True, 'label': CONFIG['label'], 'rows': CONFIG['rows']})
             elif name == 'video':

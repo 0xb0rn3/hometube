@@ -133,6 +133,26 @@ class WhoMayChangeWhatTests(ServerCase):
             self.assertEqual(self.status_of(lambda: self.get('/api/tv/status')), 403)
         self.assertEqual(json.loads(self.get('/api/tv/status').read())['route_ok'], True)
 
+    def test_probe_and_refusals_are_for_this_board(self):
+        with mock.patch.object(ht.Handler, 'local', return_value=False):
+            self.assertEqual(self.status_of(lambda: self.get('/api/tv/probe')), 403)
+        refused = RuntimeError('ERROR: [youtube] x: Sign in to confirm you\u2019re not a bot. Use --cookies')
+        with mock.patch.object(ht, '_ytdlp', side_effect=refused):
+            self.assertEqual(json.loads(self.get('/api/tv/probe').read())['lookup'], 'refused')
+        with mock.patch.object(ht, '_ytdlp', return_value={'formats': [{'manifest_url': 'https://manifest.googlevideo.com/api/manifest/hls_variant/ip/198.51.100.9/id/x'}]}):
+            d = json.loads(self.get('/api/tv/probe').read())
+        self.assertEqual((d['lookup'], d['youtube_saw']), ('ok', '198.51.100.9'))
+
+    def test_a_refusal_from_youtube_is_recorded(self):
+        ht._youtube.update(ok_at=0, refused_at=0)
+        bad = subprocess.CompletedProcess([], 1, '', 'ERROR: [youtube] x: Sign in to confirm you\u2019re not a bot.')
+        with mock.patch.object(ht.subprocess, 'run', return_value=bad):
+            with self.assertRaises(RuntimeError):
+                ht._ytdlp(['x'])
+        self.assertTrue(ht._youtube['refused_at'])
+        status = json.loads(self.get('/api/tv/status').read())
+        self.assertEqual(status['youtube_refused_at'], ht._youtube['refused_at'])
+
     def test_cross_origin_and_non_json_posts_are_refused(self):
         item = {'item': {'id': 'jNQXAC9IVRw', 'title': 'zoo'}}
         self.assertEqual(self.status_of(lambda: self.post('/api/tv/later', item, {'Origin': 'http://evil.example'})), 403)
