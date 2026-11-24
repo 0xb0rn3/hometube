@@ -1015,6 +1015,9 @@ def _version(name: str) -> str:
 ASSET_VERSIONS = {name: _version(name) for name in STATIC if (WEB_DIR / name).exists()}
 
 
+_page_agents: list[dict[str, Any]] = []   # the browsers that loaded the page lately (board-only status)
+
+
 def page_html() -> bytes:
     title = 'HomeTube' + (' · ' + CONFIG['label'] if CONFIG['label'] else '')
     html = (WEB_DIR / 'index.html').read_bytes().replace(b'__HOMETUBE_TITLE__', title.encode())
@@ -1096,6 +1099,10 @@ class Handler(BaseHTTPRequestHandler):
         path = url.path
         if path in ('/', '/tv'):
             if self.within_limit('api'):
+                ua = str(self.headers.get('User-Agent') or '')[:240]
+                if ua and not any(a['ua'] == ua for a in _page_agents):
+                    _page_agents.insert(0, {'ua': ua, 'at': int(time.time())})
+                    del _page_agents[5:]
                 self.send_bytes(200, page_html(), 'text/html; charset=utf-8', csp=PAGE_CSP)
             return
         if path.startswith('/assets/hometube/'):
@@ -1126,7 +1133,8 @@ class Handler(BaseHTTPRequestHandler):
                 ok, why = route_status(force=True)
                 self.reply(200, {'ok': True, 'route_dev': CONFIG['route_dev'] or None, 'route_ok': ok, 'route_problem': why or None,
                                  'youtube_saw': _exit_seen['ip'], 'youtube_saw_at': _exit_seen['at'] or None,
-                                 'lookup_ok_at': _youtube['ok_at'] or None, 'youtube_refused_at': _youtube['refused_at'] or None})
+                                 'lookup_ok_at': _youtube['ok_at'] or None, 'youtube_refused_at': _youtube['refused_at'] or None,
+                                 'page_browsers': _page_agents})
             elif name == 'probe':
                 if not self.local():
                     self.reply(403, {'ok': False, 'error': 'the probe runs on the board only'})

@@ -23,8 +23,11 @@
 
   // ---- which screen is this: a TV with a remote, a touch screen, or a desktop
   var UA = navigator.userAgent || '';
+  // a first guess from what the browser says; what the person actually does decides (below): TV browsers
+  // often claim a touch screen, and do not all name themselves
   var isTouch = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches) && ('ontouchstart' in window);
-  var isTV = /VIDAA|Hisense|SMART-TV|SmartTV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV/i.test(UA);
+  var isTV = /VIDAA|Hisense|HiSmart|SMART-TV|SmartTV|Smart TV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV|Roku|Philips|TV Safari/i.test(UA);
+  var touched = false;   // a finger really touched the screen
   function setMode(tv) {
     isTV = tv;
     body.classList.toggle('tv', tv);
@@ -32,8 +35,21 @@
     body.classList.toggle('desk', !tv && !isTouch);
   }
   setMode(isTV);
+  // a real touch: touch mode (the layout for fingers, the device's own video controls)
+  window.addEventListener('touchstart', function () {
+    if (touched) return;
+    touched = true; isTouch = true;
+    if (isTV) { setMode(false); if (inPlayer()) { setFull(false); $('video').controls = true; } } else setMode(false);
+  }, {passive: true});
+  // arrow keys with no touch before them: a remote (or a keyboard): TV mode, even if the browser claims touch
+  function remoteMode() {
+    if (isTV || touched) return false;
+    setMode(true);
+    if (inPlayer()) { $('video').controls = false; setFull(true); $('playBtn').focus(); }
+    return true;
+  }
 
-  var current = null, hls = null, dockTimer = null, saveTimer = null, warmTimer = null, upTimer = null;
+  var current = null, hls = null, dockTimer = null, saveTimer = null, warmTimer = null, upTimer = null, retryTimer = null;
   var subs = [], account = false, items = {}, warmed = {}, TOPICS = [];
   var queue = [], qi = -1, queueName = '', played = [], related = [], full = true, homeScroll = 0, lastCard = null, opening = 0;
 
@@ -212,7 +228,13 @@
     var name = r ? r.querySelector('h2').textContent : $('rowTitle').textContent;
     play(el.dataset.id, ids, ids.indexOf(el.dataset.id), name);
   }
-  function play(id, list, index, name) {
+  function friendly(msg) {   // no yt-dlp internals on a TV: the gist, without URLs and tool names
+    msg = String(msg || 'This video did not open.').replace(/https?:\/\/\S+/g, '').replace(/^ERROR:\s*(\[[^\]]+\]\s*)?[A-Za-z0-9_-]{11}:\s*/, '');
+    msg = msg.replace(/\s*(Use|See|Also see)\b.*$/, '').trim();
+    return msg.length > 160 ? msg.slice(0, 157) + '…' : (msg || 'This video did not open.');
+  }
+  function play(id, list, index, name, tries) {
+    clearTimeout(retryTimer);
     queue = list && list.length ? list : [id];
     qi = index >= 0 ? index : queue.indexOf(id);
     if (name !== undefined) queueName = name;
@@ -274,7 +296,17 @@
         video.src = v.hls;   // Safari and iPhone play HLS themselves
         video.addEventListener('loadedmetadata', function () { if (startAt > 0) video.currentTime = startAt; start(); }, {once: true});
       } else { throw new Error('This browser cannot play HLS video.'); }
-    }).catch(function (e) { if (token === opening) spinner(e.message, true); });
+    }).catch(function (e) {
+      if (token !== opening) return;
+      if (/not a bot|confirm you|sign in to confirm/i.test(e.message) && (tries || 0) < 9) {
+        // YouTube refuses the server this board goes out by: the board moves to another one within a
+        // minute or two, so try again by ourselves instead of leaving an error on the screen
+        spinner('YouTube is refusing this connection right now. Moving to another server; the video starts by itself.', false);
+        retryTimer = setTimeout(function () { if (token === opening) play(id, queue, qi, undefined, (tries || 0) + 1); }, 20000);
+        return;
+      }
+      spinner(friendly(e.message), true);
+    });
   }
   function start() {
     $('video').play().catch(function () { syncPlay(); });
@@ -288,7 +320,7 @@
                                   position: video.currentTime, duration: isFinite(video.duration) ? video.duration : current.duration}}, keep).catch(function () {});
   }
   function teardown() {
-    clearInterval(saveTimer); cancelUpNext();
+    clearInterval(saveTimer); cancelUpNext(); clearTimeout(retryTimer);
     var saved = remember();
     var video = $('video');
     video.pause();
@@ -627,7 +659,11 @@
   document.addEventListener('keydown', function (e) {
     var k = e.keyCode, video = $('video'), act = document.activeElement;
     var typing = act && (act.tagName === 'INPUT' || act.tagName === 'TEXTAREA');
-    if (DIRS[k] && !isTV && !typing && !isTouch && !inPlayer()) setMode(true);   // arrows on the home page of a non-touch screen: remote or keyboard mode
+    if (DIRS[k] && !isTV && !typing && !touched && remoteMode() && !inPlayer() && !(act && act.closest && act.closest('[data-nav]'))) {
+      // arrows before any touch: a remote. With nothing chosen yet, the first press lands on the first card
+      var first = document.querySelector('#rows:not([hidden]) .tv-card[data-id], #list:not([hidden]) .tv-card[data-id]');
+      if (first) { e.preventDefault(); focusCard(first); return; }
+    }
     if (!inPlayer()) {
       if (BACK.indexOf(k) >= 0 && !(k === 8 && typing)) {
         if (body.classList.contains('searching')) { e.preventDefault(); closeSearch(); return; }
