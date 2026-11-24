@@ -124,12 +124,15 @@ Only YouTube and Google cookies are kept. The page on the network cannot set or 
 Google can flag or lock an account it suddenly sees from another country, and a VPN that moves between
 servers would show it from a new one each time. So:
 
-- **Videos never use the account.** Playing, searching and the home rows are looked up without it, so
-  they can go out by whatever server a VPN picks.
+- **Videos are looked up without the account**, as are search and the rows, so they can go out by
+  whatever server a VPN picks. Only a video YouTube will not show without a sign-in (age-restricted,
+  members only, private) is looked up with it when you open it, never ahead of time, and that video
+  then plays the account's way too: YouTube ties its stream addresses to the address that looked it
+  up. Signing in does not help with "confirm you're not a bot"; the VPN picker handles that.
 - **Only the account service holds the cookies**: a separate service (`hometube-account`) under its own
   system account, with its own folder that HomeTube itself cannot read. It fetches the account's own
-  lists: subscriptions, recommendations, Watch Later and YouTube history.
-- **Those lists go out by one fixed way**, the `account_via` setting:
+  lists (subscriptions, recommendations, Watch Later, YouTube history) and those signed-in videos.
+- **All of that goes out by one fixed way**, the `account_via` setting:
   - `home` (the default): the board's own internet connection, where you use the account on your phone
     anyway, so Google sees it where it always does. With a VPN for HomeTube, the lists still skip it
     (your provider sees connections to YouTube, as it does from your phone; never what you watch).

@@ -329,7 +329,7 @@
       } else { throw new Error('This browser cannot play HLS video.'); }
     }).catch(function (e) {
       if (token !== opening) return;
-      if (/not a bot|confirm you|sign in to confirm/i.test(e.message) && (tries || 0) < 9) {
+      if (/not a bot/i.test(e.message) && (tries || 0) < 9) {   // not "confirm your age": that needs the account
         // YouTube refuses the server this board goes out by: the board moves to another one within a
         // minute or two, so try again by ourselves instead of leaving an error on the screen
         spinner('YouTube is refusing this connection right now. Moving to another server; the video starts by itself.', false);

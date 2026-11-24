@@ -195,7 +195,7 @@ def _ytdlp(args: list[str], timeout: float = 40, nice: int = 0, cookies: Path | 
     return json.loads(cp.stdout)
 
 
-YOUTUBE_REFUSED = re.compile(r'confirm you.re not a bot|Sign in to confirm', re.I)
+YOUTUBE_REFUSED = re.compile(r'confirm you.re not a bot', re.I)   # not "confirm your age": that is the video, not the server
 _youtube = {'ok_at': 0, 'refused_at': 0}
 PROBE_VIDEO = 'jNQXAC9IVRw'   # a short, old, public video that is always there
 
@@ -430,36 +430,70 @@ def search(query: str, count: int = 24, ttl: float = 600, background: bool = Fal
     return _cached(f's:{query}:{count}', ttl, make)
 
 
+# YouTube needs a sign-in for this video (not the "not a bot" refusal, which signing in is not for)
+NEEDS_SIGNIN = re.compile(r'confirm your age|inappropriate for some users|age[- ]restricted|members[- ]only|channel.s members|'
+                          r'Join this channel|Private video|Premium members', re.I)
+_account_videos: set[str] = set()   # looked up signed in: their streams go out the account's way too
+
+
+def _video_from(d: dict[str, Any], video_id: str) -> tuple[dict[str, Any], dict[tuple[str, bool], str]]:
+    """What the page needs from yt-dlp's answer, and the caption addresses."""
+    formats = d.get('formats') or []
+    hls = [f for f in formats if str(f.get('protocol', '')).startswith('m3u8')]
+    master = next((f.get('manifest_url') for f in hls if f.get('manifest_url')), None)
+    best = max(hls, key=lambda f: (f.get('height') or 0, f.get('tbr') or 0), default=None)
+    subs = []
+    for source, auto in ((d.get('subtitles') or {}, False), (d.get('automatic_captions') or {}, True)):
+        for lang, tracks in source.items():
+            if auto and lang not in ('en', d.get('language') or ''):
+                continue   # automatic captions: English and the video's own language only
+            if any(t.get('ext') == 'vtt' for t in tracks) and len(subs) < 40:
+                subs.append({'lang': lang, 'name': (tracks[0].get('name') or lang)[:40] + (' (auto)' if auto else ''), 'auto': auto})
+    caps = {(s['lang'], s['auto']): next(t['url'] for t in (d.get('automatic_captions' if s['auto'] else 'subtitles') or {})[s['lang']] if t.get('ext') == 'vtt') for s in subs}
+    chapters = [{'start': c.get('start_time'), 'title': str(c.get('title') or '')[:80]} for c in (d.get('chapters') or [])][:100]
+    info = {'id': video_id, 'title': d.get('title'), 'channel': d.get('channel') or d.get('uploader'),
+            'subtitles': subs, 'chapters': chapters, 'views': d.get('view_count'), 'upload_date': d.get('upload_date'),
+            'channel_id': d.get('channel_id'), 'duration': d.get('duration'), 'thumb': _thumb(video_id),
+            'hls': master or (best or {}).get('url'), 'live': bool(d.get('is_live')),
+            'description': str(d.get('description') or '')[:600]}
+    return info, caps
+
+
 def video(video_id: str, background: bool = False) -> dict[str, Any]:
     if not VIDEO_ID.fullmatch(video_id or ''):
         raise ValueError('not a video id')
     def make():
-        if background:   # a lookup ahead of time: one slot always stays free for the video you open
-            with _background:
-                d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'], nice=10)
-        else:
-            d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'])
-        formats = d.get('formats') or []
-        hls = [f for f in formats if str(f.get('protocol', '')).startswith('m3u8')]
-        master = next((f.get('manifest_url') for f in hls if f.get('manifest_url')), None)
-        best = max(hls, key=lambda f: (f.get('height') or 0, f.get('tbr') or 0), default=None)
-        subs = []
-        for source, auto in ((d.get('subtitles') or {}, False), (d.get('automatic_captions') or {}, True)):
-            for lang, tracks in source.items():
-                if auto and lang not in ('en', d.get('language') or ''):
-                    continue   # automatic captions: English and the video's own language only
-                if any(t.get('ext') == 'vtt' for t in tracks) and len(subs) < 40:
-                    subs.append({'lang': lang, 'name': (tracks[0].get('name') or lang)[:40] + (' (auto)' if auto else ''), 'auto': auto})
-        _caption_urls[video_id] = {(s['lang'], s['auto']): next(t['url'] for t in (d.get('automatic_captions' if s['auto'] else 'subtitles') or {})[s['lang']] if t.get('ext') == 'vtt') for s in subs}
-        chapters = [{'start': c.get('start_time'), 'title': str(c.get('title') or '')[:80]} for c in (d.get('chapters') or [])][:100]
-        _note_exit(master or (best or {}).get('url'))
-        return {'id': video_id, 'title': d.get('title'), 'channel': d.get('channel') or d.get('uploader'),
-                'subtitles': subs, 'chapters': chapters, 'views': d.get('view_count'), 'upload_date': d.get('upload_date'),
-                'channel_id': d.get('channel_id'), 'duration': d.get('duration'), 'thumb': _thumb(video_id),
-                'hls': master or (best or {}).get('url'), 'live': bool(d.get('is_live')),
-                'description': str(d.get('description') or '')[:600]}
+        url = f'https://www.youtube.com/watch?v={video_id}'
+        try:
+            if background:   # a lookup ahead of time: one slot always stays free for the video you open
+                with _background:
+                    d = _ytdlp([url], nice=10)
+            else:
+                d = _ytdlp([url])
+        except RuntimeError as exc:
+            # age-restricted, members-only, private: only signed in. Never ahead of time (a card
+            # you only looked at), only for the video you opened, and by the account's own way out
+            if background or not NEEDS_SIGNIN.search(str(exc)):
+                raise
+            return _video_signed_in(video_id)
+        info, caps = _video_from(d, video_id)
+        _caption_urls[video_id] = caps
+        _note_exit(info['hls'])
+        return info
     # stream addresses stay valid for a few hours; keep them two
     return _cached(f'v:{video_id}', 7200, make)
+
+
+def _video_signed_in(video_id: str) -> dict[str, Any]:
+    d = account_call({'op': 'video', 'id': video_id}, timeout=150)
+    if d.get('ok'):
+        _caption_urls[video_id] = {(c[0], bool(c[1])): c[2] for c in d.get('captions') or []}
+        _account_videos.add(video_id)
+        return {**d['video'], 'signed_in': True}
+    if d.get('connected') is False or 'not running' in str(d.get('error')) or 'No YouTube account' in str(d.get('error')):
+        raise RuntimeError('This video needs a YouTube sign-in (age-restricted or members only). '
+                           'Connect a YouTube account on the board to play it.')
+    raise RuntimeError(str(d.get('error') or 'The signed-in lookup did not work.'))
 
 
 _warm_next: list[str] = []
@@ -636,26 +670,35 @@ def _sign(url: str) -> str:
     return hmac.new(_key(), url.encode(), hashlib.sha256).hexdigest()[:32]
 
 
-def relay_link(url: str) -> str:
-    token = base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
-    return f'{RELAY_PATH}?u={token}&s={_sign(url)}'
+def relay_link(url: str, account: bool = False) -> str:
+    # account: a stream looked up signed in, bound to the account's address: fetched by the account service
+    signed = ('account|' if account else '') + url
+    token = base64.urlsafe_b64encode(signed.encode()).decode().rstrip('=')
+    return f'{RELAY_PATH}?u={token}&s={_sign(signed)}'
 
 
-def relay_target(token: str, signature: str) -> str:
-    """The stream address behind a relay link, only if this service signed it and it is googlevideo."""
+def relay_route(token: str, signature: str) -> tuple[str, bool]:
+    """The stream address behind a relay link, and whether the account service fetches it; only if
+    this service signed it and it is googlevideo."""
     try:
-        url = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode()
+        signed = base64.urlsafe_b64decode(token + '=' * (-len(token) % 4)).decode()
     except (ValueError, UnicodeDecodeError):
         raise ValueError('bad relay link') from None
-    if not hmac.compare_digest(_sign(url), signature or ''):
+    if not hmac.compare_digest(_sign(signed), signature or ''):
         raise ValueError('bad relay link')
+    account = signed.startswith('account|')
+    url = signed.removeprefix('account|')
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != 'https' or not RELAY_HOST.fullmatch(parts.hostname or ''):
         raise ValueError('not a stream address')
-    return url
+    return url, account
 
 
-def rewrite_playlist(text: str, base: str, h264_only: bool = False) -> str:
+def relay_target(token: str, signature: str) -> str:
+    return relay_route(token, signature)[0]
+
+
+def rewrite_playlist(text: str, base: str, h264_only: bool = False, account: bool = False) -> str:
     """Point every address in an HLS playlist at the relay. With h264_only, a master playlist keeps
     only its H.264 variants (when it has any): smart-TV browsers often cannot decode VP9."""
     lines = [line.strip() for line in text.splitlines()]
@@ -669,11 +712,11 @@ def rewrite_playlist(text: str, base: str, h264_only: bool = False) -> str:
             if keep_avc and line.startswith(('#EXT-X-STREAM-INF', '#EXT-X-I-FRAME-STREAM-INF')) and 'avc1' not in line:
                 skip_uri = line.startswith('#EXT-X-STREAM-INF')
                 continue
-            out.append(_URI_ATTR.sub(lambda m: f'URI="{relay_link(urllib.parse.urljoin(base, m.group(1)))}"', line))
+            out.append(_URI_ATTR.sub(lambda m: f'URI="{relay_link(urllib.parse.urljoin(base, m.group(1)), account)}"', line))
         elif skip_uri:
             skip_uri = False
         else:
-            out.append(relay_link(urllib.parse.urljoin(base, line)))
+            out.append(relay_link(urllib.parse.urljoin(base, line), account))
     return '\n'.join(out) + '\n'
 
 
@@ -690,11 +733,12 @@ _next_seg: dict[str, str] = {}
 _seg_lock = threading.Lock()
 
 
-def _stream_get(url: str, range_header: str | None = None) -> tuple[int, dict[str, str], bytes, str]:
+def _stream_get(url: str, range_header: str | None = None, route: bool = True) -> tuple[int, dict[str, str], bytes, str]:
     """GET a googlevideo address over a kept-open connection: through a far tunnel exit a new
     TCP+TLS connection costs about a second, and a warm one also runs about twice as fast.
     Returns status, the headers worth passing on, the body, and the final address."""
-    _require_route()
+    if route:
+        _require_route()
     headers = {'User-Agent': UA}
     if range_header and re.fullmatch(r'bytes=\d{0,15}-\d{0,15}', range_header):
         headers['Range'] = range_header
@@ -818,10 +862,11 @@ def stream_master(video_id: str) -> str:
     master = video(video_id).get('hls')
     if not master:
         raise ValueError('No playable stream for this video.')
-    status, _headers, body, final = _stream_get(master)
+    account = video_id in _account_videos
+    status, _headers, body, final = account_stream(master) if account else _stream_get(master)
     if status != 200:
         raise ValueError(f'YouTube answered {status} for the stream list')
-    return rewrite_playlist(body.decode('utf-8', 'replace'), final, h264_only=True)
+    return rewrite_playlist(body.decode('utf-8', 'replace'), final, h264_only=True, account=account)
 
 
 def _is_playlist(headers: dict[str, str], url: str) -> bool:
@@ -898,8 +943,14 @@ def captions(video_id: str, lang: str, auto: bool) -> str:
     if not url:
         raise ValueError('no such caption track')
     def make():
-        _require_route()
-        raw = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=20).read(3_000_000)
+        if video_id in _account_videos:
+            status, _h, raw, _f = account_stream(url)
+            if status != 200:
+                raise ValueError(f'YouTube answered {status} for the captions')
+            raw = raw[:3_000_000]
+        else:
+            _require_route()
+            raw = urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'}), timeout=20).read(3_000_000)
         if raw.lstrip().startswith(b'WEBVTT'):
             return raw.decode('utf-8', 'replace')
         # timedtext XML: what the caption addresses of the TV player return
@@ -1082,6 +1133,37 @@ def account_fetch(name: str, count: int = 40) -> list[dict[str, Any]]:
     return out
 
 
+def account_video(video_id: str) -> dict[str, Any]:
+    """A video YouTube shows only signed in (account service side): looked up with the account, by its way out."""
+    if not VIDEO_ID.fullmatch(video_id or ''):
+        raise ValueError('not a video id')
+    if not COOKIES.exists():
+        raise ValueError('No YouTube account is connected.')
+    ok, why = account_check()
+    if not ok:
+        raise RuntimeError(f'Your YouTube account is paused: {why}. It resumes by itself.')
+    d = _ytdlp([f'https://www.youtube.com/watch?v={video_id}'], timeout=120, cookies=COOKIES,
+               route=account_via() == 'tunnel', home=ACCOUNT_DIR)
+    info, caps = _video_from(d, video_id)
+    return {'video': info, 'captions': [[lang, auto, url] for (lang, auto), url in caps.items()]}
+
+
+TIMEDTEXT = re.compile(r'https://www\.youtube\.com/api/timedtext\?[^\s]+')
+
+
+def account_get(url: str, range_header: str | None = None) -> tuple[int, dict[str, str], bytes, str]:
+    """A part of a signed-in video (account service side): its stream addresses are bound to the
+    address that looked it up, so they are fetched from here. googlevideo and caption addresses only."""
+    tunnel = account_via() == 'tunnel'
+    if TIMEDTEXT.fullmatch(url or ''):
+        if tunnel:
+            _require_route()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(urllib.request.Request(url, headers={'User-Agent': UA}), timeout=20) as r:
+            return r.status, {'Content-Type': r.headers.get('Content-Type') or 'text/plain'}, r.read(3_000_000), url
+    return _stream_get(url, range_header, route=tunnel)   # refuses anything off googlevideo
+
+
 def account_answer(req: dict[str, Any]) -> dict[str, Any]:
     """The account service's answer to one request from HomeTube."""
     op = req.get('op')
@@ -1090,6 +1172,8 @@ def account_answer(req: dict[str, Any]) -> dict[str, Any]:
             return {'ok': True, **account_status()}
         if op == 'feed':
             return {'ok': True, 'items': account_fetch(str(req.get('name', '')), int(req.get('count') or 40))}
+        if op == 'video':
+            return {'ok': True, **account_video(str(req.get('id', '')))}
         if op == 'set':
             return {'ok': True, **account_set(str(req.get('text', ''))[:400_000])}
         if op == 'clear':
@@ -1109,6 +1193,15 @@ def account_serve(sock_path: Path = ACCOUNT_SOCK) -> None:
                 req = json.loads(self.rfile.readline(600_000) or b'{}')
             except ValueError:
                 req = {}
+            if isinstance(req, dict) and req.get('op') == 'get':   # a stream part: a header line, then the bytes
+                try:
+                    status, headers, body, final = account_get(str(req.get('url', '')), req.get('range'))
+                    head = {'ok': True, 'status': status, 'headers': headers, 'final': final, 'length': len(body)}
+                except Exception as exc:
+                    head, body = {'ok': False, 'error': str(exc)[:300]}, b''
+                self.wfile.write(json.dumps(head).encode() + b'\n')
+                self.wfile.write(body)
+                return
             self.wfile.write(json.dumps(account_answer(req if isinstance(req, dict) else {})).encode() + b'\n')
 
     class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -1138,6 +1231,29 @@ def account_call(req: dict[str, Any], timeout: float = 100, sock_path: Path | No
         return json.loads(buf or b'{}')
     except (OSError, ValueError):
         return {'ok': False, 'connected': False, 'error': 'The YouTube account service is not running.'}
+
+
+def account_stream(url: str, range_header: str | None = None) -> tuple[int, dict[str, str], bytes, str]:
+    """A part of a signed-in video, fetched by the account service (HomeTube side)."""
+    import socket
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+            s.settimeout(45)
+            s.connect(str(ACCOUNT_SOCK))
+            s.sendall(json.dumps({'op': 'get', 'url': url, 'range': range_header}).encode() + b'\n')
+            stream = s.makefile('rb')
+            head = json.loads(stream.readline(65536) or b'{}')
+            if not head.get('ok'):
+                raise RuntimeError(head.get('error') or 'The account service did not answer.')
+            length = int(head.get('length') or 0)
+            if length > 64_000_000:
+                raise ValueError('stream part too large')
+            body = stream.read(length)
+            if len(body) != length:
+                raise RuntimeError('The account service sent part of a stream piece.')
+            return int(head['status']), dict(head.get('headers') or {}), body, str(head.get('final') or url)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f'The YouTube account service could not fetch this: {exc}') from None
 
 
 def account_feed(name: str, count: int = 40) -> list[dict[str, Any]]:
@@ -1287,10 +1403,16 @@ class Handler(BaseHTTPRequestHandler):
         self.head(status, ctype, len(body), cache, csp)
         self.wfile.write(body)
 
-    def relay(self, target: str) -> None:
+    def relay(self, target: str, account: bool = False) -> None:
         """A playlist comes back rewritten (a media playlist also starts the first segments on their
-        way); a segment comes from what was fetched ahead, or straight from YouTube."""
-        if not _is_playlist({}, target) and '/videoplayback' in target:
+        way); a segment comes from what was fetched ahead, or straight from YouTube. A signed-in
+        video's parts come through the account service, by the account's way out."""
+        if account:
+            status, headers, body, final = account_stream(target, self.headers.get('Range'))
+            if status == 200 and (_is_playlist(headers, final) or body.lstrip().startswith(b'#EXTM3U')):
+                self.send_bytes(200, rewrite_playlist(body.decode('utf-8', 'replace'), final, account=True).encode(), 'application/vnd.apple.mpegurl')
+                return
+        elif not _is_playlist({}, target) and '/videoplayback' in target:
             status, headers, body, final = segment(target, self.headers.get('Range'))
         else:
             status, headers, body, final = _stream_get(target, self.headers.get('Range'))
@@ -1378,7 +1500,7 @@ class Handler(BaseHTTPRequestHandler):
             elif name == 'stream':
                 self.send_bytes(200, stream_master(q.get('id', '')).encode(), 'application/vnd.apple.mpegurl')
             elif name == 'hls':
-                self.relay(relay_target(q.get('u', ''), q.get('s', '')))
+                self.relay(*relay_route(q.get('u', ''), q.get('s', '')))
             elif name == 'channel':
                 self.reply(200, {'ok': True, 'items': channel(q.get('id', ''))})
             elif name == 'home':
@@ -1592,7 +1714,7 @@ ProtectControlGroups=yes
 RestrictAddressFamilies={families}
 RestrictSUIDSGID=yes
 LockPersonality=yes
-MemoryMax=384M
+MemoryMax=640M
 Nice=8
 
 [Install]
@@ -1684,7 +1806,7 @@ def cookies_command(args: list[str]) -> None:
     result = account_set(Path(args[0]).read_text(errors='replace'))
     _own_account_files()
     subprocess.run(['systemctl', 'try-restart', f'{UNIT}.service'], check=False)
-    print(f"YouTube account connected ({result['cookies']} cookies kept). Videos never use it.")
+    print(f"YouTube account connected ({result['cookies']} cookies kept). Videos use it only when YouTube shows them signed in only.")
     print(_via_sentence())
 
 
