@@ -26,18 +26,21 @@
   // a first guess from what the browser says; what the person actually does decides (below): TV browsers
   // often claim a touch screen, and do not all name themselves
   var isTouch = !!(window.matchMedia && matchMedia('(pointer: coarse)').matches) && ('ontouchstart' in window);
-  var isTV = /VIDAA|Hisense|HiSmart|SMART-TV|SmartTV|Smart TV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV|Roku|Philips|TV Safari/i.test(UA);
+  // "ViewPort/": the browser of the owner's Hisense VIDAA TV, which does not name itself (measured)
+  var isTV = /VIDAA|Hisense|HiSmart|SMART-TV|SmartTV|Smart TV|Tizen|Web0S|webOS|NetCast|HbbTV|BRAVIA|AFT[A-Z]|CrKey|Android TV|GoogleTV|Opera TV|Roku|Philips|TV Safari|ViewPort\//i.test(UA);
+  var namedTV = isTV;    // a browser that says it is a TV stays one: a TV has no touch screen (its cursor's clicks can arrive as touches)
   var touched = false;   // a finger really touched the screen
   function setMode(tv) {
     isTV = tv;
     body.classList.toggle('tv', tv);
     body.classList.toggle('touch', !tv && isTouch);
     body.classList.toggle('desk', !tv && !isTouch);
+    if (typeof allArrows === 'function') allArrows();
   }
   setMode(isTV);
   // a real touch: touch mode (the layout for fingers, the device's own video controls)
   window.addEventListener('touchstart', function () {
-    if (touched) return;
+    if (touched || namedTV) return;
     touched = true; isTouch = true;
     if (isTV) { setMode(false); if (inPlayer()) { setFull(false); $('video').controls = true; } } else setMode(false);
   }, {passive: true});
@@ -93,11 +96,12 @@
   function row(title, key) {
     var sec = document.createElement('section'); sec.className = 'tv-row';
     if (key) sec.dataset.row = key;
-    sec.innerHTML = '<h2>' + esc(title) + '</h2><div class="tv-strip"><div class="tv-track">' + skeleton(6) + '</div></div>';
+    sec.innerHTML = '<h2>' + esc(title) + '</h2>' + stripBox(skeleton(6));
     $('rows').appendChild(sec);
     return {fill: function (list) {
       if (!list.length) { sec.remove(); return; }
       sec.querySelector('.tv-track').innerHTML = list.map(card).join('');
+      arrows(sec.querySelector('.tv-strip'));
       focusFirst($('rows'));
     }, drop: function () { sec.remove(); }};
   }
@@ -113,12 +117,12 @@
       if (!list.length) { if (sec) sec.remove(); return; }
       if (!sec) {
         sec = document.createElement('section'); sec.className = 'tv-row'; sec.dataset.row = 'continue';
-        sec.innerHTML = '<h2>Continue watching</h2><div class="tv-strip"><div class="tv-track"></div></div>';
+        sec.innerHTML = '<h2>Continue watching</h2>' + stripBox('');
         $('rows').insertBefore(sec, $('rows').firstChild);
       }
       var hadFocus = sec.contains(document.activeElement), strip = sec.querySelector('.tv-strip');
       trackOf(strip).innerHTML = list.map(card).join('');
-      slide(strip, 0); strip.scrollLeft = 0;
+      slide(strip, 0); strip.scrollLeft = 0; arrows(strip);
       if (isTV && hadFocus) focusCard(trackOf(strip).querySelector('.tv-card[data-id="' + lastId + '"]') || trackOf(strip).querySelector('.tv-card'));
     }).catch(function () {});
   }
@@ -577,10 +581,59 @@
   // ---- rows. On the TV a row's cards slide with a transform: TV browsers often will not scroll a
   // row for a script, a transform always moves. Touch and mouse scroll the row themselves.
   function cardsIn(box) { return Array.prototype.slice.call(box.querySelectorAll('.tv-card[data-id]')); }
+  // ‹ › at both ends of a row, for a TV's cursor and a mouse (arrow keys move card by card as before;
+  // these are not on their path). Touch screens swipe instead.
+  function stripBox(inner) {
+    return '<div class="tv-rowbox"><div class="tv-strip"><div class="tv-track">' + inner + '</div></div>' +
+      '<button type="button" class="row-arrow prev" aria-label="Scroll left" tabindex="-1" hidden>' +
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12z"/></svg></button>' +
+      '<button type="button" class="row-arrow next" aria-label="Scroll right" tabindex="-1" hidden>' +
+      '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.6 16.6 10 18l6-6-6-6-1.4 1.4 4.6 4.6z"/></svg></button></div>';
+  }
+  function stripPos(strip) {
+    var t = trackOf(strip), x = isTV ? (t._x || 0) : strip.scrollLeft;
+    return {x: x, max: Math.max(0, (isTV ? t.scrollWidth : strip.scrollWidth) - strip.clientWidth)};
+  }
+  function arrows(strip) {
+    var box = strip && strip.parentNode;
+    if (!box || !box.classList || !box.classList.contains('tv-rowbox')) return;
+    var p = stripPos(strip);
+    box.querySelector('.row-arrow.prev').hidden = p.x <= 1;
+    box.querySelector('.row-arrow.next').hidden = p.x >= p.max - 1;
+  }
+  function slideBy(strip, dir) {
+    var p = stripPos(strip), x = Math.max(0, Math.min(p.max, p.x + dir * strip.clientWidth * 0.8));
+    if (isTV) {
+      slide(strip, x);
+      var a = document.activeElement;   // a card that slid out of sight gives its focus to the first one in sight
+      if (a && strip.contains(a)) {
+        var first = cardsIn(strip).filter(function (c) { return c.offsetLeft >= x; })[0];
+        if (first) first.focus({preventScroll: true});
+      }
+    } else {
+      try { strip.scrollTo({left: x, behavior: 'smooth'}); } catch (e) { strip.scrollLeft = x; }
+    }
+    setTimeout(function () { arrows(strip); }, 350);
+  }
+  function allArrows() { Array.prototype.forEach.call(document.querySelectorAll('#rows .tv-strip'), arrows); }
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest && e.target.closest('.row-arrow');
+    if (!b) return;
+    e.preventDefault(); e.stopPropagation();
+    slideBy(b.parentNode.querySelector('.tv-strip'), b.classList.contains('next') ? 1 : -1);
+  }, true);
+  document.addEventListener('mousedown', function (e) {   // the arrows never take the focus: the remote's keys go on from the card
+    if (e.target.closest && e.target.closest('.row-arrow')) e.preventDefault();
+  }, true);
+  document.addEventListener('scroll', function (e) {   // a mouse or trackpad scrolling a row itself
+    if (e.target && e.target.classList && e.target.classList.contains('tv-strip')) arrows(e.target);
+  }, true);
+  window.addEventListener('resize', allArrows);
   function slide(strip, x) {
     var t = trackOf(strip);
     t._x = x;
     t.style.webkitTransform = t.style.transform = 'translate3d(' + (-x) + 'px,0,0)';
+    arrows(strip);
   }
   function reveal(el, quiet) {
     var strip = el.closest('.tv-strip');
@@ -640,6 +693,12 @@
   function toTabs() { window.scrollTo(0, 0); (document.querySelector('.tv-tabs .on') || $('homeBtn')).focus(); }
   function moveHome(dir) {
     var from = document.activeElement;
+    if (!from || from === body || !(from.closest && from.closest('[data-nav]'))) {
+      // nothing chosen (a cursor clicked between the cards): back to the card you were on, or the first one
+      var back0 = lastCard && document.body.contains(lastCard) && lastCard.offsetParent ? lastCard
+        : document.querySelector('#rows:not([hidden]) .tv-card[data-id], #list:not([hidden]) .tv-card[data-id]');
+      if (back0) { focusCard(back0); return; }
+    }
     var isCard = from && from.classList && from.classList.contains('tv-card');
     var strip = isCard && from.closest('.tv-strip');
     if (strip) {

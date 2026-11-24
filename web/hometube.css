@@ -41,6 +41,18 @@ main { padding: 1vw var(--pad) 4vw; }
 .tv-strip { overflow-x: auto; overflow-y: hidden; padding: .9vw .6vw 1.2vw; margin: 0 -.6vw; scrollbar-width: none; }
 .tv-strip::-webkit-scrollbar { display: none; }
 .tv-track { position: relative; display: flex; gap: 1.4vw; }
+.tv-rowbox { position: relative; }
+/* ‹ › for a TV's cursor and a mouse: over the row's ends, at the height of the pictures */
+.row-arrow { position: absolute; top: calc(.9vw + clamp(200px, 19vw, 380px) * 9 / 32); transform: translateY(-50%); z-index: 2;
+  width: clamp(44px, 3.4vw, 72px); height: clamp(44px, 3.4vw, 72px); border-radius: 50%; border: 0; padding: 0; cursor: pointer;
+  display: grid; place-items: center; background: rgba(15, 15, 17, .82); color: #fff; box-shadow: 0 2px 14px rgba(0, 0, 0, .55); }
+.row-arrow svg { width: 62%; height: 62%; fill: currentColor; }
+.row-arrow.prev { left: -.4vw; }
+.row-arrow.next { right: -.4vw; }
+.row-arrow:hover { background: #fff; color: #111; }
+body.touch .row-arrow { display: none; }
+body.desk .row-arrow { opacity: 0; transition: opacity .15s; }
+body.desk .tv-rowbox:hover .row-arrow { opacity: 1; }
 .tv-track > .tv-card { flex: 0 0 clamp(200px, 19vw, 380px); }
 .tv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(clamp(200px, 19vw, 380px), 1fr)); gap: 1.6vw; padding: .9vw .3vw; }
 .tv-empty { color: var(--muted); padding: 1em 0; margin: 0; }
